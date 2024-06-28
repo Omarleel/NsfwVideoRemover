@@ -1,11 +1,11 @@
-import torch
+import onnxruntime
 from nudenet import NudeDetector
 
 class NsfwDetector:
     def __init__(self, umbral_minimo_expuesto, umbral_minimo_cubierto):
         self.umbral_minimo_expuesto = umbral_minimo_expuesto
         self.umbral_minimo_cubierto = umbral_minimo_cubierto
-        self.cuda_available = torch.cuda.is_available()
+        self.cuda_available = 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
         self.device = 'CUDAExecutionProvider' if self.cuda_available else 'CPUExecutionProvider'
         self.nude_detector = NudeDetector(providers=[self.device])
 

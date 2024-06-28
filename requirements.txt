@@ -2,6 +2,5 @@
 # Uninstall onnxruntime
 progress
 moviepy
-torch
 nudenet
 onnxruntime-gpu==1.18.0
