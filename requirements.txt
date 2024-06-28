@@ -1,0 +1,7 @@
+# Install CUDA 11.8 + cudnn 8.9.2
+# Uninstall onnxruntime
+progress
+moviepy
+torch
+nudenet
+onnxruntime-gpu==1.18.0
