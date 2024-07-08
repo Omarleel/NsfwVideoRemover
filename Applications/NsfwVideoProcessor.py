@@ -64,7 +64,31 @@ class NsfwVideoProcessor:
         partes = [lista[i * tamaño_parte:(i + 1) * tamaño_parte] for i in range(n)]
         partes[-1].extend(lista[n * tamaño_parte:])
         return partes
+    
+    def mark_nsfw(self, results, rango = 2):
+        # Lista para almacenar los índices que deben ser marcados como nsfw
+        indices_to_mark = set()
 
+        # Buscar todos los índices que deben ser marcados como nsfw
+        for i in range(len(results)):
+            if results[i]['nsfw']:
+                # Marcar el índice actual
+                indices_to_mark.add(i)
+                
+                # Marcar `rango` índices arriba
+                for j in range(max(0, i-rango), i):
+                    indices_to_mark.add(j)
+                
+                # Marcar `rango` índices abajo
+                for j in range(i+1, min(len(results), i+rango+1)):
+                    indices_to_mark.add(j)
+
+        # Actualizar los resultados originales basándonos en los índices encontrados
+        for i in indices_to_mark:
+            results[i]['nsfw'] = True
+
+        return results
+    
     def process_video(self):
         segmentos = []
         indice = 0
@@ -119,8 +143,10 @@ class NsfwVideoProcessor:
                     results.extend(json.load(result_file))
                 os.remove(result_file_path)
                 
+        results = self.mark_nsfw(results) 
+        results = sorted(results, key=lambda x: x['orden'])  # Ordenar resultados por la clave orden
+        
         bar2 = ChargingBar('Concatenando clips sin NSFW', max=len([result for result in results if not result['nsfw']]))
-        results = sorted(results, key=lambda x: x['orden'])  # Ordenar resultados por orden de segmento
         for result in results:
             start_time, end_time = result['intervalo']
             self.srt_generator.add_subtitle(start_time, end_time, result['detecciones'])
