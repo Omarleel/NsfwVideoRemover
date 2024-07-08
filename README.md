@@ -1,7 +1,7 @@
 # NsfwVideoRemover
 
 ## Descripción
-Este programa procesa un video en busca de contenido NSFW (Not Safe For Work) utilizando detección de imágenes. Divide el video en clips de 1 segundo, analiza cada frame para detectar contenido explícito y genera un nuevo video libre de contenido NSFW y un archivo srt (subitítulos) con información sobre la detección.
+Este programa procesa en paralelo un video en busca de contenido NSFW (Not Safe For Work) utilizando detección de imágenes. Divide el video en clips de 1 segundo, analiza cada frame para detectar contenido explícito y genera un nuevo video libre de contenido NSFW y un archivo srt (subitítulos) con información sobre la detección.
 
 ## Requisitos
 - Python 3.10

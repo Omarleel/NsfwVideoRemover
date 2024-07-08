@@ -7,5 +7,6 @@ if __name__ == "__main__":
         input_video_path=ruta_video,
         umbral_minimo_expuesto=umbral_minimo_expuesto,
         umbral_minimo_cubierto=umbral_minimo_cubierto,
+        num_procesos=4
     )
     processor.process_video()
