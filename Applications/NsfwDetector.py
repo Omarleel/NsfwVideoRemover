@@ -25,13 +25,23 @@ _REGISTERED_DLL_DIRECTORIES: set[str] = set()
 
 
 @contextlib.contextmanager
-def _inject_onnx_providers(providers: Sequence[ProviderSpec]):
-    """Inject providers into NudeNet 3.4.2, which ignores its argument."""
+def _inject_onnx_providers(
+    providers: Sequence[ProviderSpec],
+    session_options: Any | None = None,
+):
+    """Inject providers/session options into NudeNet 3.4.2.
+
+    That NudeNet release accepts ``providers`` but does not forward them to
+    ONNX Runtime. The same interception lets each CPU worker receive a bounded
+    thread budget, avoiding severe oversubscription when several sessions run.
+    """
 
     original_inference_session = ort.InferenceSession
 
     def inference_session_with_providers(*args: Any, **kwargs: Any):
         kwargs.setdefault("providers", list(providers))
+        if session_options is not None:
+            kwargs.setdefault("sess_options", session_options)
         return original_inference_session(*args, **kwargs)
 
     ort.InferenceSession = inference_session_with_providers  # type: ignore[assignment]
@@ -153,12 +163,21 @@ class NsfwDetector:
     """NudeNet wrapper with verified CUDA execution and automatic CPU fallback."""
 
     VALID_DEVICES = {"auto", "cuda", "cpu"}
+    EXCLUDED_CLASSES = (
+        "FACE_FEMALE",
+        "FACE_MALE",
+        "ARMPITS_EXPOSED",
+        "ARMPITS_COVERED",
+        "FEET_EXPOSED",
+        "FEET_COVERED",
+    )
 
     def __init__(
         self,
         umbral_minimo_expuesto: float,
         umbral_minimo_cubierto: float,
         device: str = "auto",
+        intra_op_threads: int = 0,
     ) -> None:
         normalized_device = device.strip().lower()
         if normalized_device not in self.VALID_DEVICES:
@@ -166,9 +185,13 @@ class NsfwDetector:
                 f"Dispositivo no válido: {device!r}. Usa auto, cuda o cpu."
             )
 
+        if intra_op_threads < 0:
+            raise ValueError("intra_op_threads no puede ser negativo.")
+
         self.umbral_minimo_expuesto = float(umbral_minimo_expuesto)
         self.umbral_minimo_cubierto = float(umbral_minimo_cubierto)
         self.requested_device = normalized_device
+        self.intra_op_threads = int(intra_op_threads)
         self.available_providers = list(ort.get_available_providers())
         self.fallback_reason: str | None = None
 
@@ -215,8 +238,25 @@ class NsfwDetector:
                     )
                 break
 
+    def _session_options(self) -> Any | None:
+        options_class = getattr(ort, "SessionOptions", None)
+        if options_class is None:
+            return None
+        options = options_class()
+        if self.intra_op_threads > 0:
+            options.intra_op_num_threads = self.intra_op_threads
+        options.inter_op_num_threads = 1
+
+        execution_mode = getattr(ort, "ExecutionMode", None)
+        if execution_mode is not None and hasattr(execution_mode, "ORT_SEQUENTIAL"):
+            options.execution_mode = execution_mode.ORT_SEQUENTIAL
+        graph_level = getattr(ort, "GraphOptimizationLevel", None)
+        if graph_level is not None and hasattr(graph_level, "ORT_ENABLE_ALL"):
+            options.graph_optimization_level = graph_level.ORT_ENABLE_ALL
+        return options
+
     def _new_nude_detector(self, providers: Sequence[ProviderSpec]) -> NudeDetector:
-        with _inject_onnx_providers(providers):
+        with _inject_onnx_providers(providers, self._session_options()):
             return NudeDetector(providers=list(providers))
 
     @staticmethod
@@ -285,25 +325,15 @@ class NsfwDetector:
             summary += f"; fallback={self.fallback_reason}"
         return summary
 
-    def is_nsfw(self, image: Any):
-        detections = self.nude_detector.detect(image)
+    def _classify_detections(self, detections: list[dict[str, Any]]):
         sumatoria_probabilidad_expuesto = 0.0
         contador_probabilidad_expuesto = 0
         sumatoria_probabilidad_cubierto = 0.0
         contador_probabilidad_cubierto = 0
-        excluded_classes = [
-            "FACE_FEMALE",
-            "FACE_MALE",
-            "ARMPITS_EXPOSED",
-            "ARMPITS_COVERED",
-            "FEET_EXPOSED",
-            "FEET_COVERED",
-        ]
-
         for detection in detections:
             detection_class = str(detection.get("class", ""))
             score = float(detection.get("score", 0.0))
-            if any(excluded in detection_class for excluded in excluded_classes):
+            if any(excluded in detection_class for excluded in self.EXCLUDED_CLASSES):
                 continue
 
             if "EXPOSED" in detection_class:
@@ -336,3 +366,32 @@ class NsfwDetector:
             promedio_probabilidad_expuesto,
             promedio_probabilidad_cubierto,
         )
+
+    def analyze_batch(
+        self,
+        images: Sequence[Any],
+        batch_size: int | None = None,
+    ) -> list[tuple[bool, list[dict[str, Any]], float, float]]:
+        """Run one native NudeNet batch and apply the existing thresholds."""
+
+        if not images:
+            return []
+        effective_batch_size = max(1, int(batch_size or len(images)))
+        detect_batch = getattr(self.nude_detector, "detect_batch", None)
+        if callable(detect_batch):
+            detections_per_image = detect_batch(
+                list(images), batch_size=effective_batch_size
+            )
+        else:  # pragma: no cover - compatibility with unexpected NudeNet builds
+            detections_per_image = [
+                self.nude_detector.detect(image) for image in images
+            ]
+        return [
+            self._classify_detections(list(detections))
+            for detections in detections_per_image
+        ]
+
+    def is_nsfw(self, image: Any):
+        detections = self.nude_detector.detect(image)
+        return self._classify_detections(detections)
+

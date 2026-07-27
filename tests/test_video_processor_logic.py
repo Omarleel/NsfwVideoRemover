@@ -102,6 +102,36 @@ class ProcessorLogicTests(unittest.TestCase):
         self.assertGreaterEqual(processor._resolve_workers(10, "cpu"), 1)
         self.assertLessEqual(processor._resolve_workers(10, "cpu"), 4)
 
+    def test_auto_batch_and_prefetch_are_memory_bounded(self) -> None:
+        module = self._load_module()
+        processor = self._processor(module)
+
+        hd_batch = processor._resolve_batch_size(1920, 1080, 4, "cpu")
+        uhd_batch = processor._resolve_batch_size(3840, 2160, 4, "cpu")
+        self.assertGreaterEqual(hd_batch, 1)
+        self.assertLessEqual(hd_batch, 8)
+        self.assertEqual(uhd_batch, 1)
+
+        prefetch = processor._resolve_prefetch_frames(3840, 2160, 4, 1)
+        self.assertGreaterEqual(prefetch, 2)
+        self.assertLessEqual(prefetch * 3840 * 2160 * 3, 256 * 1024 * 1024)
+
+    def test_ffmpeg_pipeline_uses_one_sequential_sampler(self) -> None:
+        module = self._load_module()
+        pipeline = module._FfmpegFramePipeline(
+            video_path="input.mp4",
+            width=640,
+            height=360,
+            clip_duration=0.5,
+            segments=[{"orden": 1}, {"orden": 2}, {"orden": 3}],
+            prefetch_frames=4,
+            ffmpeg_threads=2,
+        )
+        command = pipeline._command()
+        self.assertEqual(command.count("-i"), 1)
+        self.assertEqual(command[command.index("-frames:v") + 1], "3")
+        self.assertIn("fps=fps=1/0.5:start_time=0:eof_action=pass", command)
+
     def test_padding_marks_neighboring_segments(self) -> None:
         module = self._load_module()
         processor = self._processor(module)

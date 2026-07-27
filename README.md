@@ -1,32 +1,54 @@
 # NsfwVideoRemover
 
-Procesa un video por segmentos, analiza un frame de cada segmento con NudeNet y genera:
+Analiza un frame por intervalo con NudeNet, genera un `.srt` con las detecciones y crea un video sin los rangos marcados como NSFW.
 
-- un video nuevo sin los segmentos marcados;
-- un archivo `.srt` con las detecciones realizadas.
+Esta versión mantiene la selección automática `CUDA -> CPU`, pero cambia la arquitectura de análisis para evitar decodificar y buscar el mismo video desde varios procesos.
 
-La ejecución usa NVIDIA CUDA cuando puede inicializarse correctamente y cambia automáticamente a CPU cuando no existe una GPU compatible, el controlador es antiguo o faltan bibliotecas.
+## Arquitectura optimizada
 
-## Cambios de esta versión
+```text
+Video
+  │
+  ▼
+FFmpeg: un solo decodificador secuencial (CPU)
+  │
+  ▼
+Cola acotada de frames preparados
+  │
+  ├── CUDA: una sesión GPU persistente
+  │          CPU y GPU trabajan solapadas
+  │
+  └── CPU: lotes distribuidos a procesos persistentes
+             cada sesión recibe una cuota de hilos ONNX
+  │
+  ▼
+Resultados ordenados -> SRT -> cortes -> codificación
+```
 
-- Compatibilidad con **NVIDIA RTX 50 / Blackwell**, incluida la GeForce RTX 5060 Ti, mediante ONNX Runtime compilado para CUDA 12.8.
-- Fallback automático de inferencia `CUDA -> CPU`.
-- Fallback automático de exportación `h264_nvenc -> libx264`.
-- Las PC sin NVIDIA funcionan con el perfil CPU.
-- Eliminada la dependencia innecesaria de PyTorch: ahora se usa `multiprocessing` estándar.
-- Compatibilidad con MoviePy 2.2.1 (`moviepy.editor` ya no existe en MoviePy 2).
-- Los workers ya no escriben frames ni JSON temporales y el proceso principal no se queda esperando indefinidamente si uno falla.
-- La cantidad automática de workers es 1 con CUDA para evitar cargar varias copias del modelo en la VRAM.
-- Nueva interfaz de línea de comandos, instalador por perfiles y diagnóstico del proveedor activo.
+### Qué se optimizó
+
+- Un único proceso FFmpeg decodifica el video de forma secuencial.
+- Se eliminaron las aperturas independientes del video y los seeks aleatorios por worker.
+- Una cola con límite de memoria mantiene frames listos mientras se ejecuta la inferencia.
+- Con CUDA, la CPU decodifica el siguiente frame mientras la GPU analiza el actual.
+- NudeNet ejecuta inferencia ONNX nativa por lotes, no un bucle de llamadas individuales.
+- En CPU, esos lotes se envían a procesos que conservan el modelo cargado.
+- ONNX Runtime reparte los hilos disponibles entre workers para evitar sobresuscripción.
+- Los tamaños automáticos de lote y prefetch consideran la resolución del video.
+- Se informa el rendimiento real del análisis en frames por segundo.
+- Cuando no hay cortes, FFmpeg intenta copiar los streams sin recodificar.
+- La exportación conserva el fallback `h264_nvenc -> libx264` cuando sí es necesario recodificar.
+
+No se divide automáticamente la inferencia entre GPU y CPU. Normalmente eso añade coordinación y deja que el dispositivo más lento determine el rendimiento. El modo CUDA ya usa ambos recursos en paralelo: CPU para decodificación y alimentación; GPU para inferencia.
 
 ## Requisitos
 
 - Windows o Linux de 64 bits.
-- Python 3.10 o superior; **Python 3.11 es la opción recomendada**.
+- Python 3.10 o superior; Python 3.11 es la opción recomendada.
 - FFmpeg. MoviePy normalmente obtiene una copia mediante ImageIO.
-- Para NVIDIA: controlador NVIDIA reciente. El instalador GPU añade los runtimes CUDA y cuDNN mediante paquetes de Python, por lo que normalmente no hace falta instalar manualmente el CUDA Toolkit completo.
+- Para NVIDIA: controlador compatible con la versión de ONNX Runtime instalada.
 
-## Instalación recomendada
+## Instalación
 
 ### Detección automática
 
@@ -48,23 +70,13 @@ Linux:
 python instalar.py --auto
 ```
 
-El modo `--auto` usa `nvidia-smi` para elegir el perfil NVIDIA. Sin NVIDIA selecciona CPU. Si la instalación del runtime NVIDIA no es posible en ese entorno, el instalador cambia al perfil CPU para conservar la funcionalidad.
-
-### NVIDIA, incluida RTX 5060 Ti
-
-Windows también puede ejecutar directamente:
-
-```bat
-instalar_nvidia.bat
-```
-
-O manualmente dentro de un entorno virtual:
+### NVIDIA
 
 ```bash
 python instalar.py --nvidia
 ```
 
-El perfil fija `onnxruntime-gpu` en el rango `>=1.21,<1.27`. Esas versiones oficiales usan CUDA 12.8 y cuDNN 9; CUDA 12.8 fue la primera versión del toolkit con soporte completo para Blackwell/RTX 50.
+También están disponibles `instalar_nvidia.bat` e `instalar_nvidia.sh`.
 
 ### Solo CPU
 
@@ -72,37 +84,23 @@ El perfil fija `onnxruntime-gpu` en el rango `>=1.21,<1.27`. Esas versiones ofic
 python instalar.py --cpu
 ```
 
-También puede usarse la instalación convencional:
+O:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` es deliberadamente el perfil CPU universal. El perfil NVIDIA debe instalarse con `instalar.py` porque NudeNet 3.4.2 declara `onnxruntime` CPU como dependencia; instalar todo en un único `requirements` dejaría simultáneamente `onnxruntime` y `onnxruntime-gpu`, lo que causa instalaciones ambiguas o rotas.
-
-## Verificar la instalación
+## Verificar el entorno
 
 ```bash
 python diagnostico.py
 ```
 
-Resultado esperado con una RTX 5060 Ti correctamente configurada:
-
-```text
-Proveedores compilados: [..., 'CUDAExecutionProvider', 'CPUExecutionProvider']
-Sesión NudeNet: dispositivo=cuda; proveedores activos=CUDAExecutionProvider, CPUExecutionProvider
-OK: la inferencia CUDA está activa.
-```
-
-Si aparece `dispositivo=cpu`, el programa sigue funcionando. Actualiza el controlador NVIDIA y vuelve a ejecutar:
-
-```bash
-python instalar.py --nvidia
-```
+El diagnóstico indica los proveedores compilados y si una inferencia real puede ejecutarse con CUDA. Si CUDA falla, la aplicación continúa con CPU.
 
 ## Uso
 
-Procesar `video.mp4` con selección automática de hardware:
+Selección automática:
 
 ```bash
 python NsfwVideoRemover.py video.mp4
@@ -117,51 +115,71 @@ python NsfwVideoRemover.py video.mp4 \
   --clip-duration 1 \
   --exposed-threshold 0.15 \
   --covered-threshold 0.65 \
-  --padding-segments 2 \
+  --cut-padding 4 \
+  --prefetch-frames 0 \
+  --batch-size 0 \
   --codec auto \
   --output-dir resultados
 ```
 
-En Windows CMD escribe el comando en una sola línea o usa `^` en lugar de `\` para continuarlo.
+En Windows CMD escribe el comando en una sola línea o usa `^` para continuarlo.
 
-### Opciones principales
+## Opciones de rendimiento
 
-- `--device auto`: intenta CUDA y cae a CPU. También acepta `cuda` o `cpu`.
-- `--workers 0`: selección automática. Con CUDA se elige 1 por seguridad de VRAM.
-- `--codec auto`: intenta `h264_nvenc` si hay NVIDIA y FFmpeg lo ofrece; ante un error vuelve a `libx264`.
-- `--clip-duration`: intervalo entre frames analizados. Un valor menor detecta cambios más rápidos, pero requiere más tiempo.
-- `--padding-segments`: elimina segmentos vecinos alrededor de cada detección.
+- `--device auto`: intenta CUDA y usa CPU como fallback. También acepta `cuda` o `cpu`.
+- `--workers 0`: selección automática. CUDA usa 1 worker por defecto; CPU usa hasta 4.
+- `--prefetch-frames 0`: calcula una cola acotada por resolución, memoria y paralelismo.
+- `--batch-size 0`: calcula un lote nativo NudeNet. En CUDA prioriza lotes de hasta 4; en multiprocessing limita el tamaño de los envíos IPC.
+- `--force-reencode`: desactiva la copia rápida cuando el video no necesita cortes.
+- `--clip-duration`: intervalo entre frames analizados. Un valor menor aumenta cobertura y costo.
+- `--cut-padding`: segundos eliminados antes y después de cada detección.
+- `--codec auto`: usa NVENC cuando está disponible y recurre a `libx264` si falla.
 
-## Compatibilidad de GPU
+### Perfiles sugeridos
 
-No existe un único binario CUDA que acelere literalmente todas las tarjetas NVIDIA de todas las generaciones. Este proyecto sigue esta política:
+GPU:
 
-1. Las GPU compatibles con ONNX Runtime CUDA 12.8 usan aceleración.
-2. Una NVIDIA sin soporte de esa runtime, con controlador insuficiente o sin CUDA utilizable cambia a CPU.
-3. La exportación NVENC es independiente de la inferencia CUDA; si la tarjeta o FFmpeg no admiten el encoder solicitado, se usa `libx264`.
+```bash
+python NsfwVideoRemover.py video.mp4 --device auto --workers 1
+```
 
-Por eso el proyecto puede ejecutarse en más equipos sin hacer que la presencia de una GPU sea un requisito obligatorio.
+CPU automática:
 
-## Notas técnicas
+```bash
+python NsfwVideoRemover.py video.mp4 --device cpu --workers 0
+```
 
-NudeNet 3.4.2 acepta un parámetro `providers`, pero su implementación publicada no lo reenvía a `onnxruntime.InferenceSession`. `applications/NsfwDetector.py` aplica el proveedor durante la creación de la sesión y después comprueba `session.get_providers()` para conocer el proveedor realmente activo.
+Memoria limitada:
 
-Fuentes técnicas:
+```bash
+python NsfwVideoRemover.py video.mp4 --prefetch-frames 2 --batch-size 1
+```
 
-- ONNX Runtime CUDA Execution Provider: https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html
-- NVIDIA CUDA 12.8 y Blackwell: https://developer.nvidia.com/blog/cuda-toolkit-12-8-delivers-nvidia-blackwell-support/
-- Compute capability de GPU NVIDIA: https://developer.nvidia.com/cuda/gpus
-- Migración de MoviePy 1 a 2: https://zulko.github.io/moviepy/getting_started/updating_to_v2.html
+No conviene aumentar `--workers` en CUDA sin medir. Cada worker crea otra sesión ONNX y otra copia del modelo en VRAM.
+
+## Salida de rendimiento
+
+Durante la ejecución se muestran los parámetros elegidos y el throughput:
+
+```text
+Workers de inferencia: 1
+Pipeline: prefetch=8 frames; lote=4; threads FFmpeg=8
+Análisis completado: 600 frames en 83.41s (7.19 frames/s).
+```
+
+Esos valores permiten comparar configuraciones en el mismo equipo sin cambiar el código.
 
 ## Pruebas
-
-Las pruebas unitarias no necesitan una GPU real y comprueban la selección CUDA/CPU, el fallback cuando CUDA falla, los umbrales, la segmentación, el padding y la selección de codec:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
+Las pruebas cubren selección CUDA/CPU, fallback, umbrales, segmentación, padding, codec, presupuesto de hilos ONNX y configuración del pipeline FFmpeg.
+
+Para detalles de diseño y una guía de medición, consulta [`OPTIMIZACION.md`](OPTIMIZACION.md).
+
 ## Autores
 
 - Omarleel — desarrollador original.
-- Adaptación de compatibilidad CPU/NVIDIA realizada sobre el proyecto proporcionado.
+- Optimización y adaptación de compatibilidad CPU/NVIDIA sobre el proyecto proporcionado.

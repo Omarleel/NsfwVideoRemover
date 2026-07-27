@@ -78,6 +78,32 @@ def build_parser() -> argparse.ArgumentParser:
             "libx264 como fallback."
         ),
     )
+    parser.add_argument(
+        "--prefetch-frames",
+        type=int,
+        default=0,
+        help=(
+            "Frames que el decodificador mantiene preparados. 0 calcula un "
+            "valor acotado según resolución, memoria y workers."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Frames procesados en una inferencia NudeNet nativa. 0 calcula "
+            "el lote según dispositivo, resolución y costo IPC."
+        ),
+    )
+    parser.add_argument(
+        "--force-reencode",
+        action="store_true",
+        help=(
+            "Recodifica incluso cuando no hay cortes. Sin esta opción se "
+            "intenta una copia rápida de los streams."
+        ),
+    )
     return parser
 
 
@@ -94,6 +120,9 @@ def main() -> None:
         codec=args.codec,
         cut_padding_seconds=args.cut_padding_seconds,
         padding_segments=args.padding_segments,
+        prefetch_frames=args.prefetch_frames,
+        batch_size=args.batch_size,
+        fast_copy_when_unchanged=not args.force_reencode,
     )
     processor.process_video()
 
