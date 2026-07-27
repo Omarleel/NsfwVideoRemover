@@ -1,0 +1,5 @@
+# Perfil de runtime NVIDIA. Instálalo mediante `python instalar.py --nvidia`.
+# NudeNet 3.4.2 declara onnxruntime (CPU) como dependencia; el instalador lo
+# añade con --no-deps para impedir que reemplace/duplique onnxruntime-gpu.
+-r requirements-common.txt
+onnxruntime-gpu[cuda,cudnn]>=1.21,<1.27

@@ -1,6 +1,5 @@
-# Install CUDA 11.8 + cudnn 8.9.2
-# Uninstall onnxruntime
-progress
-moviepy
-nudenet
-onnxruntime-gpu==1.18.0
+# Perfil CPU universal. Funciona también en una PC con NVIDIA, pero sin acelerar
+# la inferencia. Para CUDA usa: python instalar.py --nvidia
+-r requirements-common.txt
+onnxruntime>=1.21,<1.27
+nudenet==3.4.2

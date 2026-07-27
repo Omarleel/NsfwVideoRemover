@@ -1,0 +1,6 @@
+# Dependencias compartidas por CPU y NVIDIA.
+moviepy==2.2.1
+progress>=1.6,<2
+numpy>=1.25,<3
+opencv-python-headless>=4.8,<5
+imageio-ffmpeg>=0.5,<1
