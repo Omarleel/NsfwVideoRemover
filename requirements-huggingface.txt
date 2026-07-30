@@ -1,0 +1,6 @@
+# Backend opcional para clasificadores de imágenes de Hugging Face.
+-r requirements-common.txt
+torch>=2.2,<3
+transformers>=4.40,<6
+pillow>=10,<13
+safetensors>=0.4,<1

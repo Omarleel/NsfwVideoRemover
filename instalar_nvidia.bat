@@ -16,5 +16,5 @@ call .venv\Scripts\activate.bat
 if errorlevel 1 exit /b 1
 
 :use_current
-python instalar.py --nvidia
+python instalar.py --detector nudenet --nvidia
 exit /b %errorlevel%

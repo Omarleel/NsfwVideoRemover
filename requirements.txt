@@ -1,5 +1,4 @@
-# Perfil CPU universal. Funciona también en una PC con NVIDIA, pero sin acelerar
-# la inferencia. Para CUDA usa: python instalar.py --nvidia
+# Perfil NudeNet CPU. Para Hugging Face usa requirements-huggingface.txt.
 -r requirements-common.txt
 onnxruntime>=1.21,<1.27
 nudenet==3.4.2

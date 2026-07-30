@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+
+from applications.constants import (
+    DEFAULT_CLIP_DURATION,
+    DEFAULT_COVERED_THRESHOLD,
+    DEFAULT_CUT_PADDING_SECONDS,
+    DEFAULT_EXPOSED_THRESHOLD,
+    DEFAULT_HUGGINGFACE_MODEL,
+    DEFAULT_NSFW_THRESHOLD,
+)
 from applications.NsfwVideoProcessor import NsfwVideoProcessor
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Analiza un video con NudeNet y elimina los segmentos marcados "
-            "como NSFW. Usa CUDA cuando está disponible y CPU como fallback."
+            "Analiza un video con un detector intercambiable y elimina los "
+            "intervalos marcados como NSFW."
         )
     )
     parser.add_argument(
@@ -24,10 +33,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Carpeta de salida. Por defecto usa la carpeta del video.",
     )
     parser.add_argument(
+        "--detector",
+        choices=("nudenet", "huggingface"),
+        default="nudenet",
+        help="Backend de clasificación. NudeNet se mantiene por compatibilidad.",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=DEFAULT_HUGGINGFACE_MODEL,
+        help=(
+            "Modelo compatible con image-classification cuando se usa "
+            "--detector huggingface."
+        ),
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cuda", "cpu"),
         default="auto",
-        help="Proveedor de inferencia. auto intenta CUDA y cae a CPU.",
+        help="Dispositivo de inferencia. auto intenta CUDA y cae a CPU.",
     )
     parser.add_argument(
         "--workers",
@@ -38,30 +61,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clip-duration",
         type=float,
-        default=1.0,
+        default=DEFAULT_CLIP_DURATION,
         help="Duración en segundos de cada segmento analizado.",
     )
     parser.add_argument(
         "--exposed-threshold",
         type=float,
-        default=0.15,
-        help="Umbral promedio para clases EXPOSED.",
+        default=DEFAULT_EXPOSED_THRESHOLD,
+        help="Umbral NudeNet para clases EXPOSED.",
     )
     parser.add_argument(
         "--covered-threshold",
         type=float,
-        default=0.65,
-        help="Umbral promedio para clases COVERED.",
+        default=DEFAULT_COVERED_THRESHOLD,
+        help="Umbral NudeNet para clases COVERED.",
+    )
+    parser.add_argument(
+        "--nudenet-aggregation",
+        choices=("max", "mean"),
+        default="max",
+        help=(
+            "Cómo combinar detecciones NudeNet. max evita que una detección "
+            "fuerte quede diluida; mean conserva el comportamiento anterior."
+        ),
+    )
+    parser.add_argument(
+        "--nsfw-threshold",
+        type=float,
+        default=DEFAULT_NSFW_THRESHOLD,
+        help="Umbral de la clase NSFW para detectores de clasificación.",
     )
     parser.add_argument(
         "--cut-padding",
         "--padding-seconds",
         dest="cut_padding_seconds",
         type=float,
-        default=4.0,
+        default=DEFAULT_CUT_PADDING_SECONDS,
         help=(
             "Segundos exactos que se cortan antes y después de cada "
-            "detección prohibida (por defecto: 4)."
+            f"detección (por defecto: {DEFAULT_CUT_PADDING_SECONDS:g})."
         ),
     )
     parser.add_argument(
@@ -82,26 +120,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefetch-frames",
         type=int,
         default=0,
-        help=(
-            "Frames que el decodificador mantiene preparados. 0 calcula un "
-            "valor acotado según resolución, memoria y workers."
-        ),
+        help="Frames preparados por el decodificador; 0 calcula un valor seguro.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=0,
-        help=(
-            "Frames procesados en una inferencia NudeNet nativa. 0 calcula "
-            "el lote según dispositivo, resolución y costo IPC."
-        ),
+        help="Frames por lote de inferencia; 0 calcula un valor seguro.",
     )
     parser.add_argument(
         "--force-reencode",
         action="store_true",
+        help="Recodifica incluso cuando no hay cortes.",
+    )
+    parser.add_argument(
+        "--analyze-only",
+        action="store_true",
         help=(
-            "Recodifica incluso cuando no hay cortes. Sin esta opción se "
-            "intenta una copia rápida de los streams."
+            "Solo genera SRT e informe JSON. Elimina cualquier salida de video "
+            "antigua para evitar confusiones."
         ),
     )
     return parser
@@ -123,6 +160,11 @@ def main() -> None:
         prefetch_frames=args.prefetch_frames,
         batch_size=args.batch_size,
         fast_copy_when_unchanged=not args.force_reencode,
+        detector_backend=args.detector,
+        model_id=args.model_id,
+        nsfw_threshold=args.nsfw_threshold,
+        nudenet_aggregation=args.nudenet_aggregation,
+        analyze_only=args.analyze_only,
     )
     processor.process_video()
 

@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+
 
 def package_version(name: str) -> str:
     try:
@@ -48,13 +50,19 @@ def find_cudnn_engine_dll() -> list[str]:
         root = Path(entry)
         if not root.is_dir():
             continue
-        candidate = root / "nvidia" / "cudnn" / "bin" / "cudnn_engines_tensor_ir64_9.dll"
+        candidate = (
+            root
+            / "nvidia"
+            / "cudnn"
+            / "bin"
+            / "cudnn_engines_tensor_ir64_9.dll"
+        )
         if candidate.is_file():
             matches.append(str(candidate.resolve()))
     return list(dict.fromkeys(matches))
 
 
-def main(require_cuda: bool = False) -> int:
+def print_common_info() -> None:
     print("=== Diagnóstico NsfwVideoRemover ===")
     print(f"Python: {sys.version.split()[0]} ({struct.calcsize('P') * 8} bits)")
     print(f"Sistema: {platform.platform()}")
@@ -63,20 +71,23 @@ def main(require_cuda: bool = False) -> int:
         "nudenet",
         "onnxruntime",
         "onnxruntime-gpu",
-        "nvidia-cudnn-cu12",
-        "nvidia-cublas-cu12",
-        "nvidia-cuda-runtime-cu12",
+        "torch",
+        "transformers",
+        "pillow",
         "moviepy",
         "opencv-python-headless",
     ):
         print(f"{package}: {package_version(package)}")
 
+
+def diagnose_nudenet(*, require_cuda: bool) -> int:
     dlls = find_cudnn_engine_dll()
     if platform.system() == "Windows":
-        if dlls:
-            print(f"DLL crítica cuDNN: encontrada en {dlls[0]}")
-        else:
-            print("DLL crítica cuDNN: NO ENCONTRADA")
+        print(
+            f"DLL crítica cuDNN: encontrada en {dlls[0]}"
+            if dlls
+            else "DLL crítica cuDNN: NO ENCONTRADA"
+        )
 
     try:
         import onnxruntime as ort
@@ -86,41 +97,136 @@ def main(require_cuda: bool = False) -> int:
 
     print(f"Proveedores compilados: {ort.get_available_providers()}")
     try:
-        from applications.NsfwDetector import NsfwDetector
+        from applications.detectors.config import DetectorConfig
+        from applications.detectors.factory import create_detector
 
-        # NsfwDetector now runs a real blank-frame inference before reporting CUDA.
-        detector = NsfwDetector(0.15, 0.65, device="auto")
+        detector = create_detector(DetectorConfig(backend="nudenet", device="auto"))
         print(f"Prueba real NudeNet: {detector.provider_summary()}")
     except Exception as exc:
         print(f"ERROR ejecutando la prueba real NudeNet: {exc}")
         return 1
 
     if detector.device == "cuda":
-        print("OK: una inferencia real con cuDNN se ejecutó mediante CUDA.")
+        print("OK: una inferencia real se ejecutó mediante CUDA.")
         return 0
 
-    print("OK: el proyecto funciona por CPU.")
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
-        print("Para NVIDIA ejecuta: python instalar.py --nvidia")
-    elif detector.fallback_reason:
-        print(f"Motivo del fallback: {detector.fallback_reason}")
-
+    print("OK: NudeNet funciona por CPU.")
+    fallback_reason = getattr(detector, "fallback_reason", None)
+    if fallback_reason:
+        print(f"Motivo del fallback: {fallback_reason}")
     if require_cuda:
-        print("ERROR: se exigió CUDA, pero la inferencia real terminó en CPU.")
+        print("ERROR: se exigió CUDA, pero la inferencia terminó en CPU.")
         return 2
     return 0
 
 
+def diagnose_huggingface(
+    *,
+    require_cuda: bool,
+    load_model: bool,
+    model_id: str,
+) -> int:
+    try:
+        import torch
+        import transformers  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception as exc:
+        print(f"ERROR importando el backend Hugging Face: {exc}")
+        return 1
+
+    cuda_available = bool(torch.cuda.is_available())
+    print(f"PyTorch detecta CUDA: {cuda_available}")
+    if require_cuda and not cuda_available:
+        print("ERROR: se exigió CUDA, pero PyTorch no detectó una GPU utilizable.")
+        return 2
+
+    if not load_model:
+        print(
+            "OK: dependencias Hugging Face disponibles. Usa --load-model para "
+            "descargar/cargar el modelo y ejecutar una inferencia en blanco."
+        )
+        return 0
+
+    try:
+        from applications.detectors.config import DetectorConfig
+        from applications.detectors.factory import create_detector
+
+        requested_device = "cuda" if require_cuda else "auto"
+        detector = create_detector(
+            DetectorConfig(
+                backend="huggingface",
+                device=requested_device,
+                model_id=model_id,
+            )
+        )
+        assessment = detector.analyze_batch(
+            [np.zeros((224, 224, 3), dtype=np.uint8)],
+            batch_size=1,
+        )[0]
+        print(f"Prueba real Hugging Face: {detector.provider_summary()}")
+        print(
+            "Resultado de imagen en blanco: "
+            f"nsfw={assessment.is_nsfw}; score={assessment.score:.4f}"
+        )
+    except Exception as exc:
+        print(f"ERROR cargando o ejecutando el modelo Hugging Face: {exc}")
+        return 1
+
+    if require_cuda and detector.device != "cuda":
+        print("ERROR: se exigió CUDA, pero el detector terminó en CPU.")
+        return 2
+    print("OK: el modelo Hugging Face ejecutó una inferencia real.")
+    return 0
+
+
+def main(
+    *,
+    detector: str,
+    require_cuda: bool,
+    load_model: bool,
+    model_id: str,
+) -> int:
+    print_common_info()
+    if detector == "huggingface":
+        return diagnose_huggingface(
+            require_cuda=require_cuda,
+            load_model=load_model,
+            model_id=model_id,
+        )
+    return diagnose_nudenet(require_cuda=require_cuda)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Comprueba CPU, CUDA y cuDNN.")
+    parser = argparse.ArgumentParser(description="Comprueba los backends y aceleradores.")
+    parser.add_argument(
+        "--detector",
+        choices=("nudenet", "huggingface"),
+        default="nudenet",
+    )
+    parser.add_argument(
+        "--model-id",
+        default="Falconsai/nsfw_image_detection",
+    )
     parser.add_argument(
         "--require-cuda",
         action="store_true",
-        help="Devuelve error si una inferencia real no se ejecuta mediante CUDA.",
+        help="Devuelve error si el backend no puede usar CUDA.",
+    )
+    parser.add_argument(
+        "--load-model",
+        action="store_true",
+        help="En Hugging Face, descarga/carga el modelo y ejecuta una prueba real.",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    raise SystemExit(main(require_cuda=args.require_cuda))
+    raise SystemExit(
+        main(
+            detector=args.detector,
+            require_cuda=args.require_cuda,
+            load_model=args.load_model,
+            model_id=args.model_id,
+        )
+    )

@@ -7,4 +7,4 @@ else
 fi
 "$PYTHON" -m venv .venv
 . .venv/bin/activate
-python instalar.py --nvidia
+python instalar.py --detector nudenet --nvidia

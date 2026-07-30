@@ -4,26 +4,41 @@ import gc
 import multiprocessing as mp
 import os
 import queue
-import shutil
 import subprocess
 import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO, Callable, Iterator
 
 import numpy as np
 from imageio_ffmpeg import get_ffmpeg_exe
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip
 from progress.bar import ChargingBar
 
-from applications.NsfwDetector import NsfwDetector
+from applications.constants import (
+    DEFAULT_CLIP_DURATION,
+    DEFAULT_COVERED_THRESHOLD,
+    DEFAULT_CUT_PADDING_SECONDS,
+    DEFAULT_EXPOSED_THRESHOLD,
+    DEFAULT_NSFW_THRESHOLD,
+)
+from applications.detectors import (
+    ContentDetector,
+    DetectionAssessment,
+    DetectorConfig,
+    create_detector,
+)
+from applications.reporting import AnalysisReportWriter
 from applications.SrtGenerator import SrtGenerator
+from applications.video_policies import CutIntervalPolicy, SegmentPlanner
+from applications.video_renderer import VideoRenderer
 
 
-_WORKER_DETECTOR: NsfwDetector | None = None
+_WORKER_DETECTOR: ContentDetector | None = None
 _FRAME_SENTINEL = object()
+DetectorBuilder = Callable[[DetectorConfig], ContentDetector]
 
 
 class _PipelineFailure:
@@ -33,37 +48,44 @@ class _PipelineFailure:
         self.error = error
 
 
-def _subclip(video: VideoFileClip, start_time: float, end_time: float):
-    """MoviePy 2.x helper kept separate to simplify future API changes."""
-
-    return video.subclipped(start_time, end_time)
-
-
-def _initialize_detector_worker(
-    umbral_minimo_expuesto: float,
-    umbral_minimo_cubierto: float,
-    device: str,
-    intra_op_threads: int,
-) -> None:
+def _initialize_detector_worker(config: DetectorConfig) -> None:
     global _WORKER_DETECTOR
-    _WORKER_DETECTOR = NsfwDetector(
-        umbral_minimo_expuesto=umbral_minimo_expuesto,
-        umbral_minimo_cubierto=umbral_minimo_cubierto,
-        device=device,
-        intra_op_threads=intra_op_threads,
+    _WORKER_DETECTOR = create_detector(config)
+
+
+def _coerce_assessment(value: Any) -> DetectionAssessment:
+    if isinstance(value, DetectionAssessment):
+        return value
+    try:
+        is_nsfw, detections, exposed, covered = value
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "El detector debe devolver DetectionAssessment o el tuple legado de 4 valores."
+        ) from exc
+    return DetectionAssessment(
+        is_nsfw=bool(is_nsfw),
+        score=max(float(exposed), float(covered)),
+        detections=tuple(dict(item) for item in detections),
+        metrics={"exposed": float(exposed), "covered": float(covered)},
+        model_name="legacy",
     )
 
 
 def _build_analysis_result(
     segment: dict[str, Any],
-    assessment: tuple[bool, list[dict[str, Any]], float, float],
+    assessment_value: Any,
 ) -> dict[str, Any]:
-    es_nsfw, detections, promedio_expuesto, promedio_cubierto = assessment
+    assessment = _coerce_assessment(assessment_value)
     result = dict(segment)
-    result["detecciones"] = detections
-    result["nsfw"] = es_nsfw
-    result["promedio_expuesto"] = promedio_expuesto
-    result["promedio_cubierto"] = promedio_cubierto
+    result["detecciones"] = [dict(item) for item in assessment.detections]
+    result["nsfw"] = assessment.is_nsfw
+    result["score_nsfw"] = assessment.score
+    result["motivo"] = assessment.reason
+    result["metricas"] = dict(assessment.metrics)
+    result["modelo"] = assessment.model_name
+    # Backward-compatible diagnostic fields.
+    result["promedio_expuesto"] = assessment.exposed_score
+    result["promedio_cubierto"] = assessment.covered_score
     return result
 
 
@@ -77,7 +99,7 @@ def _analyze_batch(
         batch_size=len(batch),
     )
     if len(assessments) != len(batch):
-        raise RuntimeError("NudeNet devolvió una cantidad inesperada de resultados.")
+        raise RuntimeError("El detector devolvió una cantidad inesperada de resultados.")
     return [
         _build_analysis_result(segment, assessment)
         for (segment, _frame), assessment in zip(batch, assessments)
@@ -97,13 +119,7 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes:
 
 
 class _FfmpegFramePipeline:
-    """Decode sampled frames once and feed inference through a bounded queue.
-
-    FFmpeg performs sequential decoding in its own process while a Python thread
-    drains stdout. The consumer can therefore execute ONNX inference at the same
-    time without opening one decoder per worker or seeking independently for
-    every segment.
-    """
+    """Decode sampled frames once and feed inference through a bounded queue."""
 
     def __init__(
         self,
@@ -130,9 +146,7 @@ class _FfmpegFramePipeline:
         self._process: subprocess.Popen[bytes] | None = None
 
     def _command(self) -> list[str]:
-        sample_filter = (
-            f"fps=fps=1/{self.clip_duration:.12g}:start_time=0:eof_action=pass"
-        )
+        sample_filter = f"fps=fps=1/{self.clip_duration:.12g}:start_time=0:eof_action=pass"
         return [
             get_ffmpeg_exe(),
             "-hide_banner",
@@ -157,7 +171,10 @@ class _FfmpegFramePipeline:
             "pipe:1",
         ]
 
-    def _put(self, item: tuple[dict[str, Any], np.ndarray] | _PipelineFailure | object) -> bool:
+    def _put(
+        self,
+        item: tuple[dict[str, Any], np.ndarray] | _PipelineFailure | object,
+    ) -> bool:
         while not self._stop_event.is_set():
             try:
                 self._queue.put(item, timeout=0.1)
@@ -206,8 +223,7 @@ class _FfmpegFramePipeline:
                 stderr_file.seek(0)
                 details = stderr_file.read().decode("utf-8", errors="replace").strip()
                 raise RuntimeError(
-                    f"FFmpeg falló durante la decodificación (código {return_code}). "
-                    f"{details}"
+                    f"FFmpeg falló durante la decodificación (código {return_code}). {details}"
                 )
         except BaseException as exc:
             self._put(_PipelineFailure(exc))
@@ -220,6 +236,8 @@ class _FfmpegFramePipeline:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
             stderr_file.close()
             self._put(_FRAME_SENTINEL)
 
@@ -254,59 +272,36 @@ class _FfmpegFramePipeline:
         self.close()
 
 
-def _ffmpeg_encoders() -> set[str]:
-    try:
-        process = subprocess.run(
-            [get_ffmpeg_exe(), "-hide_banner", "-encoders"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return set()
-
-    encoders: set[str] = set()
-    for line in process.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and len(parts[0]) == 6:
-            encoders.add(parts[1])
-    return encoders
-
-
-def _nvidia_driver_is_visible() -> bool:
-    executable = shutil.which("nvidia-smi") or shutil.which("nvidia-smi.exe")
-    if not executable:
-        return False
-    try:
-        result = subprocess.run(
-            [executable, "-L"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and "NVIDIA" in result.stdout.upper()
-
-
 class NsfwVideoProcessor:
+    """Coordinates analysis without depending on a concrete ML model."""
+
     def __init__(
         self,
         input_video_path: str,
-        umbral_minimo_expuesto: float = 0.15,
-        umbral_minimo_cubierto: float = 0.65,
+        umbral_minimo_expuesto: float = DEFAULT_EXPOSED_THRESHOLD,
+        umbral_minimo_cubierto: float = DEFAULT_COVERED_THRESHOLD,
         output_folder_path: str = "",
-        clip_duration: float = 1.0,
+        clip_duration: float = DEFAULT_CLIP_DURATION,
         num_procesos: int = 0,
         device: str = "auto",
         codec: str = "auto",
-        cut_padding_seconds: float = 2.0,
+        cut_padding_seconds: float = DEFAULT_CUT_PADDING_SECONDS,
         padding_segments: int | None = None,
         prefetch_frames: int = 0,
         batch_size: int = 0,
         fast_copy_when_unchanged: bool = True,
+        detector_backend: str = "nudenet",
+        model_id: str = "Falconsai/nsfw_image_detection",
+        nsfw_threshold: float = DEFAULT_NSFW_THRESHOLD,
+        nudenet_aggregation: str = "max",
+        analyze_only: bool = False,
+        detector_config: DetectorConfig | None = None,
+        detector: ContentDetector | None = None,
+        detector_factory: DetectorBuilder = create_detector,
+        segment_planner: SegmentPlanner | None = None,
+        cut_policy: CutIntervalPolicy | None = None,
+        report_writer: AnalysisReportWriter | None = None,
+        renderer: VideoRenderer | None = None,
     ) -> None:
         self.video_path = str(Path(input_video_path).expanduser().resolve())
         if not os.path.isfile(self.video_path):
@@ -324,64 +319,75 @@ class NsfwVideoProcessor:
         if batch_size < 0:
             raise ValueError("batch_size no puede ser negativo.")
 
-        self.umbral_minimo_expuesto = float(umbral_minimo_expuesto)
-        self.umbral_minimo_cubierto = float(umbral_minimo_cubierto)
         self.clip_duration = float(clip_duration)
-        self.requested_workers = int(num_procesos)
-        self.requested_prefetch_frames = int(prefetch_frames)
-        self.requested_batch_size = int(batch_size)
-        self.device = device
-        self.codec = codec
-        self.fast_copy_when_unchanged = bool(fast_copy_when_unchanged)
-        # ``padding_segments`` is retained only for compatibility with older
-        # callers. New code should express the margin directly in seconds.
         if padding_segments is not None:
             cut_padding_seconds = float(padding_segments) * self.clip_duration
         self.cut_padding_seconds = float(cut_padding_seconds)
-        self.srt_generator = SrtGenerator()
+        self.requested_workers = int(num_procesos)
+        self.requested_prefetch_frames = int(prefetch_frames)
+        self.requested_batch_size = int(batch_size)
+        self.codec = codec
+        self.fast_copy_when_unchanged = bool(fast_copy_when_unchanged)
+        self.analyze_only = bool(analyze_only)
+
+        self.detector_config = detector_config or DetectorConfig(
+            backend=detector_backend,
+            device=device,
+            model_id=model_id,
+            nsfw_threshold=nsfw_threshold,
+            exposed_threshold=umbral_minimo_expuesto,
+            covered_threshold=umbral_minimo_cubierto,
+            nudenet_aggregation=nudenet_aggregation,
+        )
+        self.device = self.detector_config.device
+        self.umbral_minimo_expuesto = self.detector_config.exposed_threshold
+        self.umbral_minimo_cubierto = self.detector_config.covered_threshold
+        self._injected_detector = detector
+        self._detector_factory = detector_factory
+        self._custom_factory = detector_factory is not create_detector
+        self._external_backend = self.detector_config.backend not in {
+            "nudenet",
+            "huggingface",
+        }
+
+        self.segment_planner = segment_planner or SegmentPlanner(self.clip_duration)
+        self.cut_policy = cut_policy or CutIntervalPolicy(self.cut_padding_seconds)
+        self.report_writer = report_writer or AnalysisReportWriter(SrtGenerator())
 
         output_folder = Path(output_folder_path).expanduser()
         if not output_folder_path:
             output_folder = Path(self.video_path).parent
         output_folder.mkdir(parents=True, exist_ok=True)
-
         stem = Path(self.video_path).stem
         self.output_video_path = str(output_folder / f"{stem} (no_nsfw).mp4")
         self.output_srt_path = str(output_folder / f"{stem}.srt")
+        self.output_report_path = str(output_folder / f"{stem}.analysis.json")
+        self.renderer = renderer or VideoRenderer(
+            input_path=self.video_path,
+            output_path=self.output_video_path,
+            codec=self.codec,
+            fast_copy_when_unchanged=self.fast_copy_when_unchanged,
+        )
         self.active_device = "cpu"
 
     def _build_segments(self, duration: float) -> list[dict[str, Any]]:
-        segments: list[dict[str, Any]] = []
-        start_time = 0.0
-        index = 1
-        while start_time < duration:
-            end_time = min(start_time + self.clip_duration, duration)
-            segments.append(
-                {
-                    "orden": index,
-                    "intervalo": [start_time, end_time],
-                    "detecciones": None,
-                    "nsfw": None,
-                }
-            )
-            index += 1
-            start_time = end_time
-        return segments
+        return self.segment_planner.build(duration)
 
     def _resolve_workers(self, number_of_segments: int, active_device: str) -> int:
-        if number_of_segments <= 1:
+        if (
+            number_of_segments <= 1
+            or self._injected_detector is not None
+            or self._custom_factory
+            or self._external_backend
+        ):
             return 1
         if self.requested_workers > 0:
             return min(self.requested_workers, number_of_segments)
         if active_device == "cuda":
-            # The optimized GPU pipeline already overlaps CPU decoding and GPU
-            # inference. More sessions usually consume VRAM without increasing
-            # throughput, so one CUDA session remains the safe default.
             return 1
         cpu_count = os.cpu_count() or 1
         decode_threads = self._resolve_ffmpeg_threads("cpu")
         inference_threads = max(1, cpu_count - decode_threads)
-        # Keep at least two logical threads per ONNX CPU session when possible.
         worker_capacity = max(1, inference_threads // 2)
         return max(1, min(4, worker_capacity, number_of_segments))
 
@@ -395,8 +401,6 @@ class NsfwVideoProcessor:
         if self.requested_batch_size > 0:
             return self.requested_batch_size
         frame_bytes = max(1, int(width) * int(height) * 3)
-        # Local inference avoids multiprocessing serialization, so it can use a
-        # larger raw-frame batch. IPC batches remain deliberately smaller.
         target_bytes = 128 * 1024 * 1024 if workers == 1 else 32 * 1024 * 1024
         memory_limited = max(1, target_bytes // frame_bytes)
         preferred = 4 if active_device == "cuda" or workers == 1 else 8
@@ -438,7 +442,7 @@ class NsfwVideoProcessor:
     def _analyze_sequential_pipeline(
         self,
         frame_pipeline: _FfmpegFramePipeline,
-        detector: NsfwDetector,
+        detector: ContentDetector,
         batch_size: int,
         number_of_segments: int,
     ) -> list[dict[str, Any]]:
@@ -453,9 +457,7 @@ class NsfwVideoProcessor:
                 batch_size=len(batch),
             )
             if len(assessments) != len(batch):
-                raise RuntimeError(
-                    "NudeNet devolvió una cantidad inesperada de resultados."
-                )
+                raise RuntimeError("El detector devolvió una cantidad inesperada de resultados.")
             for (segment, _frame), assessment in zip(batch, assessments):
                 results.append(_build_analysis_result(segment, assessment))
                 bar.next()
@@ -486,8 +488,10 @@ class NsfwVideoProcessor:
         pending: set[Future[list[dict[str, Any]]]] = set()
         max_pending_batches = max(2, workers * 2)
         spawn_context = mp.get_context("spawn")
-        worker_threads = self._worker_thread_budget(
-            workers, active_device, ffmpeg_threads
+        worker_threads = self._worker_thread_budget(workers, active_device, ffmpeg_threads)
+        worker_config = self.detector_config.with_runtime(
+            device=active_device,
+            intra_op_threads=worker_threads,
         )
         bar = ChargingBar("Pipeline decodificación/inferencia", max=number_of_segments)
 
@@ -510,12 +514,7 @@ class NsfwVideoProcessor:
                 max_workers=workers,
                 mp_context=spawn_context,
                 initializer=_initialize_detector_worker,
-                initargs=(
-                    self.umbral_minimo_expuesto,
-                    self.umbral_minimo_cubierto,
-                    active_device,
-                    worker_threads,
-                ),
+                initargs=(worker_config,),
             ) as executor:
                 batch: list[tuple[dict[str, Any], np.ndarray]] = []
                 for item in frame_pipeline:
@@ -527,7 +526,6 @@ class NsfwVideoProcessor:
                     collect_completed(block=False)
                     while len(pending) >= max_pending_batches:
                         collect_completed(block=True)
-
                 if batch:
                     pending.add(executor.submit(_analyze_batch, batch))
                 while pending:
@@ -539,25 +537,20 @@ class NsfwVideoProcessor:
     def _analyze_with_pipeline(
         self,
         segments: list[dict[str, Any]],
-        detector: NsfwDetector | None,
+        detector: ContentDetector | None,
         width: int,
         height: int,
         workers: int,
         active_device: str,
     ) -> list[dict[str, Any]]:
-        batch_size = self._resolve_batch_size(
-            width, height, workers, active_device
-        )
-        prefetch_frames = self._resolve_prefetch_frames(
-            width, height, workers, batch_size
-        )
+        batch_size = self._resolve_batch_size(width, height, workers, active_device)
+        prefetch_frames = self._resolve_prefetch_frames(width, height, workers, batch_size)
         ffmpeg_threads = self._resolve_ffmpeg_threads(active_device)
         print(
             "Pipeline: "
             f"prefetch={prefetch_frames} frames; lote={batch_size}; "
             f"threads FFmpeg={ffmpeg_threads}"
         )
-
         with _FfmpegFramePipeline(
             video_path=self.video_path,
             width=width,
@@ -591,64 +584,20 @@ class NsfwVideoProcessor:
         duration: float,
         padding_seconds: float | None = None,
     ) -> list[tuple[float, float]]:
-        """Return merged time ranges removed around prohibited detections.
-
-        A frame is sampled at the beginning of every analysis segment. If that
-        frame is prohibited at time ``t``, the exact interval
-        ``[t - padding, t + padding]`` is removed. Overlapping or touching
-        intervals are merged so MoviePy never cuts the same area twice.
-        """
-
-        padding = (
-            self.cut_padding_seconds
-            if padding_seconds is None
-            else max(0.0, float(padding_seconds))
-        )
-        raw_intervals: list[tuple[float, float]] = []
-        for result in results:
-            if not result.get("nsfw"):
-                continue
-            detection_time = float(result["intervalo"][0])
-            start_time = max(0.0, detection_time - padding)
-            end_time = min(float(duration), detection_time + padding)
-            if end_time > start_time:
-                raw_intervals.append((start_time, end_time))
-
-        if not raw_intervals:
-            return []
-
-        raw_intervals.sort(key=lambda interval: interval[0])
-        merged: list[list[float]] = [list(raw_intervals[0])]
-        epsilon = 1e-9
-        for start_time, end_time in raw_intervals[1:]:
-            previous = merged[-1]
-            if start_time <= previous[1] + epsilon:
-                previous[1] = max(previous[1], end_time)
-            else:
-                merged.append([start_time, end_time])
-        return [(start_time, end_time) for start_time, end_time in merged]
+        return self.cut_policy.build_cut_intervals(results, duration, padding_seconds)
 
     @staticmethod
     def _build_allowed_intervals(
-        duration: float, cut_intervals: list[tuple[float, float]]
+        duration: float,
+        cut_intervals: list[tuple[float, float]],
     ) -> list[tuple[float, float]]:
-        """Return the complement of the cut intervals inside the video."""
-
-        allowed: list[tuple[float, float]] = []
-        cursor = 0.0
-        for cut_start, cut_end in cut_intervals:
-            if cut_start > cursor:
-                allowed.append((cursor, cut_start))
-            cursor = max(cursor, cut_end)
-        if cursor < duration:
-            allowed.append((cursor, duration))
-        return allowed
+        return CutIntervalPolicy.build_allowed_intervals(duration, cut_intervals)
 
     def mark_nsfw(
-        self, results: list[dict[str, Any]], rango: int | None = None
+        self,
+        results: list[dict[str, Any]],
+        rango: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Legacy helper retained for callers using segment-based padding."""
-
         radius = 0 if rango is None else max(0, int(rango))
         indices_to_mark: set[int] = set()
         for index, result in enumerate(results):
@@ -661,186 +610,85 @@ class NsfwVideoProcessor:
         return results
 
     def _codec_candidates(self) -> list[str]:
-        requested = self.codec.strip().lower()
-        if requested != "auto":
-            if requested.endswith("_nvenc"):
-                return [requested, "libx264"]
-            return [requested]
-
-        encoders = _ffmpeg_encoders()
-        if _nvidia_driver_is_visible() and "h264_nvenc" in encoders:
-            return ["h264_nvenc", "libx264"]
-        return ["libx264"]
-
-    def _try_fast_copy(self) -> bool:
-        if not self.fast_copy_when_unchanged:
-            return False
-        if os.path.exists(self.output_video_path):
-            os.remove(self.output_video_path)
-        command = [
-            get_ffmpeg_exe(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-i",
-            self.video_path,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            self.output_video_path,
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        if result.returncode == 0 and os.path.isfile(self.output_video_path):
-            return True
-        if os.path.exists(self.output_video_path):
-            os.remove(self.output_video_path)
-        return False
-
-    def _write_video_with_fallback(self, final_clip) -> str:
-        errors: list[str] = []
-        for codec in self._codec_candidates():
-            try:
-                if os.path.exists(self.output_video_path):
-                    os.remove(self.output_video_path)
-                print(f"Codificando con {codec}...")
-                final_clip.write_videofile(
-                    self.output_video_path,
-                    codec=codec,
-                    audio_codec="aac",
-                    threads=max(1, min(16, os.cpu_count() or 1)),
-                    pixel_format="yuv420p",
-                )
-                return codec
-            except Exception as exc:  # pragma: no cover - ffmpeg/hardware dependent
-                errors.append(f"{codec}: {exc}")
-                if os.path.exists(self.output_video_path):
-                    try:
-                        os.remove(self.output_video_path)
-                    except OSError:
-                        pass
-                print(f"Falló {codec}; probando el siguiente codec disponible.")
-
-        raise RuntimeError(
-            "No se pudo generar el video. Errores de codificación:\n- "
-            + "\n- ".join(errors)
-        )
+        return self.renderer.codec_candidates()
 
     def _render_results(
         self,
         results: list[dict[str, Any]],
         duration: float,
         cut_intervals: list[tuple[float, float]],
+        detector_name: str,
     ) -> None:
-        allowed_intervals = self._build_allowed_intervals(duration, cut_intervals)
-        for result in results:
-            start_time, end_time = result["intervalo"]
-            self.srt_generator.add_subtitle(
-                start_time, end_time, result.get("detecciones") or []
-            )
-        self.srt_generator.generate_srt(self.output_srt_path)
+        self.report_writer.write(
+            video_path=self.video_path,
+            duration=duration,
+            detector_name=detector_name,
+            results=results,
+            cut_intervals=cut_intervals,
+            srt_path=self.output_srt_path,
+            json_path=self.output_report_path,
+        )
         print(f"Archivo SRT guardado en {self.output_srt_path}")
+        print(f"Informe JSON guardado en {self.output_report_path}")
 
         if cut_intervals:
             print("Intervalos eliminados por detecciones prohibidas:")
             for start_time, end_time in cut_intervals:
                 print(f"  - {start_time:.3f}s a {end_time:.3f}s")
-        else:
-            print("No se detectaron clases prohibidas; se conservará el video completo.")
-            if self._try_fast_copy():
-                print(
-                    f"Video guardado en {self.output_video_path} "
-                    "sin recodificación."
-                )
-                return
-            print("No fue posible copiar los streams; se recodificará el video.")
 
-        if not allowed_intervals:
-            print("Todo el video quedó dentro de los cortes; no se generó salida.")
+        if self.analyze_only:
+            self.renderer.remove_stale_output()
+            print("Modo análisis: no se generó un video de salida.")
             return
 
-        source_video = VideoFileClip(self.video_path)
-        clips = []
-        final_clip = None
-        bar = ChargingBar("Preparando clips permitidos", max=len(allowed_intervals))
-        bar_was_finished = False
-        try:
-            for start_time, end_time in allowed_intervals:
-                clips.append(_subclip(source_video, start_time, end_time))
-                bar.next()
-            bar.finish()
-            bar_was_finished = True
+        allowed_intervals = self._build_allowed_intervals(duration, cut_intervals)
+        self.renderer.render(
+            allowed_intervals=allowed_intervals,
+            cut_intervals=cut_intervals,
+        )
 
-            final_clip = concatenate_videoclips(clips, method="chain")
-            used_codec = self._write_video_with_fallback(final_clip)
-            print(
-                f"Video guardado en {self.output_video_path} "
-                f"(codec: {used_codec})"
-            )
-        finally:
-            if not bar_was_finished:
-                bar.finish()
-            if final_clip is not None:
-                final_clip.close()
-            for clip in clips:
-                clip.close()
-            source_video.close()
+    def _create_detector(self, config: DetectorConfig) -> ContentDetector:
+        return self._detector_factory(config)
 
     def process_video(self) -> list[dict[str, Any]]:
+        # Never leave an old output that could be mistaken for the current run.
+        self.renderer.remove_stale_output()
         with VideoFileClip(self.video_path) as video:
             duration = float(video.duration)
-            width, height = (int(video.size[0]), int(video.size[1]))
+            width, height = int(video.size[0]), int(video.size[1])
         segments = self._build_segments(duration)
         if not segments:
             raise RuntimeError("El video no contiene segmentos procesables.")
 
-        requested_device = self.device.strip().lower()
-        local_detector: NsfwDetector | None = None
-        if requested_device == "cpu":
+        local_detector: ContentDetector | None = self._injected_detector
+        if local_detector is not None:
+            self.active_device = local_detector.device
+            workers = 1
+            print(f"Detector inyectado: {local_detector.provider_summary()}")
+        elif self.detector_config.device == "cpu":
             self.active_device = "cpu"
             workers = self._resolve_workers(len(segments), self.active_device)
             if workers == 1:
                 cpu_count = os.cpu_count() or 1
                 decode_threads = self._resolve_ffmpeg_threads("cpu")
-                local_detector = NsfwDetector(
-                    umbral_minimo_expuesto=self.umbral_minimo_expuesto,
-                    umbral_minimo_cubierto=self.umbral_minimo_cubierto,
+                local_config = self.detector_config.with_runtime(
                     device="cpu",
                     intra_op_threads=max(1, cpu_count - decode_threads),
                 )
-                print(f"ONNX Runtime: {local_detector.provider_summary()}")
+                local_detector = self._create_detector(local_config)
+                print(f"Detector: {local_detector.provider_summary()}")
             else:
                 print(
-                    "ONNX Runtime: dispositivo=cpu; las sesiones se inicializarán "
-                    "directamente dentro de los workers."
+                    f"Detector={self.detector_config.backend}; dispositivo=cpu; "
+                    "las sesiones se inicializarán dentro de los workers."
                 )
         else:
-            detector = NsfwDetector(
-                umbral_minimo_expuesto=self.umbral_minimo_expuesto,
-                umbral_minimo_cubierto=self.umbral_minimo_cubierto,
-                device=self.device,
-            )
-            self.active_device = detector.device
-            print(f"ONNX Runtime: {detector.provider_summary()}")
-            workers = self._resolve_workers(len(segments), detector.device)
-            local_detector = detector
+            local_detector = self._create_detector(self.detector_config)
+            self.active_device = local_detector.device
+            print(f"Detector: {local_detector.provider_summary()}")
+            workers = self._resolve_workers(len(segments), self.active_device)
             if workers > 1:
-                del detector
+                del local_detector
                 local_detector = None
                 gc.collect()
 
@@ -868,5 +716,10 @@ class NsfwVideoProcessor:
 
         results.sort(key=lambda item: item["orden"])
         cut_intervals = self._build_cut_intervals(results, duration)
-        self._render_results(results, duration, cut_intervals)
+        detector_name = (
+            local_detector.name
+            if local_detector is not None
+            else self.detector_config.backend
+        )
+        self._render_results(results, duration, cut_intervals, detector_name)
         return results

@@ -1,185 +1,150 @@
 # NsfwVideoRemover
 
-Analiza un frame por intervalo con NudeNet, genera un `.srt` con las detecciones y crea un video sin los rangos marcados como NSFW.
+Analiza frames de un video con un detector de contenido intercambiable, genera un informe y, opcionalmente, elimina los intervalos marcados.
 
-Esta versión mantiene la selección automática `CUDA -> CPU`, pero cambia la arquitectura de análisis para evitar decodificar y buscar el mismo video desde varios procesos.
+---
 
-## Arquitectura optimizada
+## 🛠 Requisitos e Instalación
 
-```text
-Video
-  │
-  ▼
-FFmpeg: un solo decodificador secuencial (CPU)
-  │
-  ▼
-Cola acotada de frames preparados
-  │
-  ├── CUDA: una sesión GPU persistente
-  │          CPU y GPU trabajan solapadas
-  │
-  └── CPU: lotes distribuidos a procesos persistentes
-             cada sesión recibe una cuota de hilos ONNX
-  │
-  ▼
-Resultados ordenados -> SRT -> cortes -> codificación
-```
+- **Python 3.10+** (64 bits).
+- **FFmpeg** (proporcionado normalmente por `imageio-ffmpeg`).
+- Espacio adicional para modelos y runtimes.
 
-### Qué se optimizó
+El instalador protegido exige un entorno virtual para evitar conflictos con el Python global.
 
-- Un único proceso FFmpeg decodifica el video de forma secuencial.
-- Se eliminaron las aperturas independientes del video y los seeks aleatorios por worker.
-- Una cola con límite de memoria mantiene frames listos mientras se ejecuta la inferencia.
-- Con CUDA, la CPU decodifica el siguiente frame mientras la GPU analiza el actual.
-- NudeNet ejecuta inferencia ONNX nativa por lotes, no un bucle de llamadas individuales.
-- En CPU, esos lotes se envían a procesos que conservan el modelo cargado.
-- ONNX Runtime reparte los hilos disponibles entre workers para evitar sobresuscripción.
-- Los tamaños automáticos de lote y prefetch consideran la resolución del video.
-- Se informa el rendimiento real del análisis en frames por segundo.
-- Cuando no hay cortes, FFmpeg intenta copiar los streams sin recodificar.
-- La exportación conserva el fallback `h264_nvenc -> libx264` cuando sí es necesario recodificar.
-
-No se divide automáticamente la inferencia entre GPU y CPU. Normalmente eso añade coordinación y deja que el dispositivo más lento determine el rendimiento. El modo CUDA ya usa ambos recursos en paralelo: CPU para decodificación y alimentación; GPU para inferencia.
-
-## Requisitos
-
-- Windows o Linux de 64 bits.
-- Python 3.10 o superior; Python 3.11 es la opción recomendada.
-- FFmpeg. MoviePy normalmente obtiene una copia mediante ImageIO.
-- Para NVIDIA: controlador compatible con la versión de ONNX Runtime instalada.
-
-## Instalación
-
-### Detección automática
-
+**Crear entorno (recomendado):**
 ```bash
 python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
 ```
 
-Windows:
+**Instalar según el motor deseado:**
+- **NudeNet (CPU):** `python instalar.py --detector nudenet --cpu`
+- **NudeNet (NVIDIA auto):** `python instalar.py --detector nudenet --auto`
+- **Hugging Face (Auto):** `python instalar.py --detector huggingface --auto`
 
-```bat
-.venv\Scripts\activate
-python instalar.py --auto
-```
+*(Para probar la carga del modelo de Hugging Face: `python diagnostico.py --detector huggingface --load-model`)*
 
-Linux:
+---
 
-```bash
-. .venv/bin/activate
-python instalar.py --auto
-```
+## 🚀 Uso
 
-### NVIDIA
-
-```bash
-python instalar.py --nvidia
-```
-
-También están disponibles `instalar_nvidia.bat` e `instalar_nvidia.sh`.
-
-### Solo CPU
-
-```bash
-python instalar.py --cpu
-```
-
-O:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Verificar el entorno
-
-```bash
-python diagnostico.py
-```
-
-El diagnóstico indica los proveedores compilados y si una inferencia real puede ejecutarse con CUDA. Si CUDA falla, la aplicación continúa con CPU.
-
-## Uso
-
-Selección automática:
-
-```bash
-python NsfwVideoRemover.py video.mp4
-```
-
-Ejemplo completo:
-
+### 1. Usando NudeNet
+`max` (por defecto) toma la detección más fuerte para no diluir el resultado. `mean` conserva el comportamiento de versiones anteriores.
 ```bash
 python NsfwVideoRemover.py video.mp4 \
+  --detector nudenet \
   --device auto \
-  --workers 0 \
-  --clip-duration 1 \
+  --nudenet-aggregation max \
   --exposed-threshold 0.15 \
   --covered-threshold 0.65 \
-  --cut-padding 4 \
-  --prefetch-frames 0 \
-  --batch-size 0 \
-  --codec auto \
-  --output-dir resultados
+  --cut-padding 4
 ```
 
-En Windows CMD escribe el comando en una sola línea o usa `^` para continuarlo.
-
-## Opciones de rendimiento
-
-- `--device auto`: intenta CUDA y usa CPU como fallback. También acepta `cuda` o `cpu`.
-- `--workers 0`: selección automática. CUDA usa 1 worker por defecto; CPU usa hasta 4.
-- `--prefetch-frames 0`: calcula una cola acotada por resolución, memoria y paralelismo.
-- `--batch-size 0`: calcula un lote nativo NudeNet. En CUDA prioriza lotes de hasta 4; en multiprocessing limita el tamaño de los envíos IPC.
-- `--force-reencode`: desactiva la copia rápida cuando el video no necesita cortes.
-- `--clip-duration`: intervalo entre frames analizados. Un valor menor aumenta cobertura y costo.
-- `--cut-padding`: segundos eliminados antes y después de cada detección.
-- `--codec auto`: usa NVENC cuando está disponible y recurre a `libx264` si falla.
-
-### Perfiles sugeridos
-
-GPU:
-
+### 2. Usando Hugging Face (ej. Falconsai)
+Usa la puntuación de la etiqueta NSFW para compararla con el umbral.
 ```bash
-python NsfwVideoRemover.py video.mp4 --device auto --workers 1
+python NsfwVideoRemover.py video.mp4 \
+  --detector huggingface \
+  --model-id Falconsai/nsfw_image_detection \
+  --device auto \
+  --nsfw-threshold 0.50 \
+  --cut-padding 4
 ```
 
-CPU automática:
-
+### 3. Modo Análisis (Solo revisión)
+Genera `video.srt` y `video.analysis.json` sin renderizar un nuevo video ni aplicar recodificación. Elimina videos de salida antiguos para evitar confusiones.
 ```bash
-python NsfwVideoRemover.py video.mp4 --device cpu --workers 0
+python NsfwVideoRemover.py video.mp4 --detector huggingface --analyze-only
 ```
 
-Memoria limitada:
+---
 
-```bash
-python NsfwVideoRemover.py video.mp4 --prefetch-frames 2 --batch-size 1
-```
+## ⚙️ Optimización y Rendimiento
 
-No conviene aumentar `--workers` en CUDA sin medir. Cada worker crea otra sesión ONNX y otra copia del modelo en VRAM.
+El sistema está diseñado para maximizar la eficiencia en la extracción de frames y el uso de memoria:
+- **Canalización eficiente:** FFmpeg abre un único decodificador y produce frames RGB ordenados en una cola acotada (~256 MiB o 32 frames), evitando múltiples procesos o búsquedas independientes.
+- **Workers:** Selección automática (`--workers 0`). En CUDA, usa 1 worker para no saturar la VRAM; en CPU usa hasta 4, reservando hilos para FFmpeg.
+- **Lotes (`--batch-size`):** Calculado automáticamente según resolución, dispositivo y costo de IPC.
+- **Segmentación estable:** El tiempo se deriva del índice matemático, eliminando errores de coma flotante (segmentos fantasma).
+- **Recodificación:** `--codec auto` intenta NVENC como prioridad, cayendo a `libx264`. Se usa *fast copy* si no hay cortes (configurable con `--force-reencode`).
 
-## Salida de rendimiento
+*Nota sobre métricas: Reducir `--clip-duration` mejora la precisión temporal pero aumenta linealmente los tiempos de inferencia. Mide siempre FPS y uso de memoria al ajustar estos parámetros.*
 
-Durante la ejecución se muestran los parámetros elegidos y el throughput:
+---
 
+## 🏗 Arquitectura y Extensibilidad (SOLID)
+
+La lógica del video (extracción, reportes, renderizado) está completamente separada de los modelos de IA.
 ```text
-Workers de inferencia: 1
-Pipeline: prefetch=8 frames; lote=4; threads FFmpeg=8
-Análisis completado: 600 frames en 83.41s (7.19 frames/s).
+NsfwVideoProcessor (Orquestador)
+ ├─ SegmentPlanner (Crea segmentos matemáticamente)
+ ├─ ContentDetector (Interfaz / Protocolo para los modelos)
+ │   ├─ NudeNetDetector
+ │   └─ HuggingFaceImageDetector
+ ├─ CutIntervalPolicy (Combina rangos y aplica padding)
+ ├─ AnalysisReportWriter (SRT y JSON atómicos)
+ └─ VideoRenderer (Copia rápida, códecs y limpieza)
 ```
 
-Esos valores permiten comparar configuraciones en el mismo equipo sin cambiar el código.
+### Cómo añadir un nuevo detector
+Solo necesitas crear una clase que cumpla el contrato `ContentDetector` y registrarla en el `DetectorFactory`.
 
-## Pruebas
+```python
+from applications.detectors.base import DetectionAssessment
+from applications.detectors.factory import DetectorFactory
 
+class MiDetector:
+    name = "mi-detector"
+    device = "cpu"
+
+    def analyze_batch(self, images, batch_size=None):
+        return [
+            DetectionAssessment(
+                is_nsfw=False, score=0.0, detections=(), model_name=self.name
+            ) for _ in images
+        ]
+
+    def provider_summary(self):
+        return "modelo=mi-detector; dispositivo=cpu"
+
+# Registrar en la fábrica
+DetectorFactory.register("mi-detector", lambda config: MiDetector())
+```
+
+---
+
+## 📄 Formato del Informe JSON
+Todos los backends generan una estructura estable:
+```json
+{
+  "orden": 1,
+  "intervalo": [0.0, 1.0],
+  "nsfw": false,
+  "score_nsfw": 0.08,
+  "motivo": null,
+  "metricas": {"nsfw": 0.08},
+  "modelo": "Falconsai/nsfw_image_detection",
+  "detecciones": [
+    {"class": "normal", "score": 0.92},
+    {"class": "nsfw", "score": 0.08}
+  ]
+}
+```
+
+---
+
+## 🧪 Pruebas y Limitaciones
+
+**Ejecutar pruebas:**
 ```bash
 python -m unittest discover -s tests -v
 ```
+Las pruebas cubren fallbacks, presupuestos de ONNX, combinaciones de intervalos y reescritura atómica.
 
-Las pruebas cubren selección CUDA/CPU, fallback, umbrales, segmentación, padding, codec, presupuesto de hilos ONNX y configuración del pipeline FFmpeg.
-
-Para detalles de diseño y una guía de medición, consulta [`OPTIMIZACION.md`](OPTIMIZACION.md).
-
-## Autores
-
-- Omarleel — desarrollador original.
-- Optimización y adaptación de compatibilidad CPU/NVIDIA sobre el proyecto proporcionado.
+**Consideraciones importantes:**
+- Ningún modelo es perfecto. Revisa el JSON/SRT antes de automatizar el borrado.
+- Se analiza **un frame por segmento**; frames intermedios no se escanean individualmente.
+- Cortar el video con MoviePy recodifica video y audio; es posible que se pierdan streams adicionales del archivo original.
+- Cada modelo de Hugging Face usa etiquetas distintas. Lee la *Model Card* antes de cambiar `--model-id`.

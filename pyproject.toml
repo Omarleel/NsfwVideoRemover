@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsfw-video-remover"
+version = "2.0.0"
+description = "Video analysis and cutting pipeline with interchangeable image detectors."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "moviepy==2.2.1",
+  "progress>=1.6,<2",
+  "numpy>=1.25,<3",
+  "opencv-python-headless>=4.8,<5",
+  "imageio-ffmpeg>=0.5,<1",
+]
+
+[project.optional-dependencies]
+nudenet-cpu = [
+  "onnxruntime>=1.21,<1.27",
+  "nudenet==3.4.2",
+]
+huggingface = [
+  "torch>=2.2,<3",
+  "transformers>=4.40,<6",
+  "pillow>=10,<13",
+  "safetensors>=0.4,<1",
+]
+dev = ["ruff>=0.6,<1", "mypy>=1.11,<2"]
+
+[project.scripts]
+nsfw-video-remover = "NsfwVideoRemover:main"
+
+[tool.setuptools]
+py-modules = ["NsfwVideoRemover", "diagnostico", "instalar"]
+
+[tool.setuptools.packages.find]
+include = ["applications*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

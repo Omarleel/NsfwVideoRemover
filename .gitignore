@@ -3,7 +3,14 @@ __pycache__/
 *.py[cod]
 *.log
 *.srt
+*.analysis.json
 * (no_nsfw).mp4
 temp_frames/
 resultados/
 videos/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
