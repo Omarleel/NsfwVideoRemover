@@ -29,6 +29,7 @@ if "progress.bar" not in sys.modules:
 
 from imageio_ffmpeg import get_ffmpeg_exe
 
+from applications.ffmpeg_capabilities import FfmpegCapabilities
 from applications.profiling import PerformanceProfiler
 from applications.video_renderer import VideoRenderer
 
@@ -55,6 +56,57 @@ class ProfilerTests(unittest.TestCase):
             summary = payload["summary"]["operations_by_total_time"][0]
             self.assertEqual(summary["count"], 2)
             self.assertIsNotNone(summary["p95_seconds"])
+            self.assertIsNotNone(payload["memory"]["initial_rss_bytes"])
+            self.assertIsNotNone(payload["memory"]["final_rss_bytes"])
+            self.assertTrue(all(event["rss_bytes"] is not None for event in payload["events"]))
+            self.assertGreaterEqual(len(payload["system_resource_samples"]), 2)
+            self.assertIsNotNone(
+                payload["summary"]["system_resources"]["process_tree_peak_rss_bytes"]
+            )
+
+
+    def test_registered_child_process_is_sampled_with_role_and_rss(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "child.profile.json"
+            profiler = PerformanceProfiler(str(path), enabled=True)
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; data=bytearray(4_000_000); time.sleep(1)"],
+            )
+            try:
+                profiler.register_child_process(child.pid, role="test_child")
+                time.sleep(0.1)
+                profiler.capture_system_sample(reason="test_child_alive")
+            finally:
+                child.wait(timeout=5)
+            profiler.write(status="completed")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            matching = [
+                process
+                for sample in payload["system_resource_samples"]
+                for process in sample.get("process_tree", [])
+                if process.get("pid") == child.pid
+            ]
+            self.assertTrue(matching)
+            self.assertTrue(any(item.get("role") == "test_child" for item in matching))
+            self.assertTrue(any((item.get("rss_bytes") or 0) > 0 for item in matching))
+
+    def test_auto_renderer_prefers_nvenc_and_keeps_x264_fallback(self) -> None:
+        capabilities = FfmpegCapabilities(
+            executable="ffmpeg",
+            hwaccels=frozenset({"cuda"}),
+            filters=frozenset({"scale_cuda"}),
+            encoders=frozenset({"h264_nvenc", "libx264"}),
+        )
+        renderer = VideoRenderer(
+            input_path="input.mp4",
+            output_path="output.mp4",
+            codec="auto",
+            ffmpeg_executable="ffmpeg",
+            ffmpeg_capabilities=capabilities,
+        )
+        self.assertEqual(renderer.codec_candidates(), ["h264_nvenc", "libx264"])
 
     def test_renderer_records_real_ffmpeg_progress(self) -> None:
         import subprocess

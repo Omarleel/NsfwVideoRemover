@@ -122,9 +122,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--codec",
         default="auto",
         help=(
-            "Encoder de salida cuando existen cortes. 'auto' usa libx264 con "
-            "cortes exactos; 'copy' prioriza velocidad, pero puede perder GOP "
-            "sanos en los bordes. También admite h264_nvenc u otro encoder FFmpeg."
+            "Encoder de salida. 'auto' prefiere h264_nvenc cuando el FFmpeg y "
+            "la GPU lo permiten, con fallback automático a libx264. 'copy' es "
+            "más rápido, pero puede perder GOP sanos en los bordes."
+        ),
+    )
+    parser.add_argument(
+        "--hardware-accel",
+        choices=("auto", "cuda", "none"),
+        default="auto",
+        help=(
+            "Aceleración FFmpeg. auto intenta NVDEC/scale_cuda y NVENC; cuda "
+            "lo solicita explícitamente; none fuerza la ruta por CPU."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg",
+        default="",
+        help=(
+            "Ruta a un FFmpeg concreto. Por defecto se elige entre NSFW_FFMPEG, "
+            "ffmpeg del sistema e imageio-ffmpeg, priorizando soporte CUDA/NVENC."
         ),
     )
     parser.add_argument(
@@ -192,6 +209,8 @@ def main() -> None:
         analyze_only=args.analyze_only,
         profile_enabled=not args.no_profile,
         profile_output_path=args.profile_output,
+        ffmpeg_executable=args.ffmpeg,
+        hardware_acceleration=args.hardware_accel,
     )
     processor.process_video()
 

@@ -13,6 +13,10 @@ from typing import Protocol
 from imageio_ffmpeg import get_ffmpeg_exe
 from progress.bar import ChargingBar
 
+from applications.ffmpeg_capabilities import (
+    FfmpegCapabilities,
+    resolve_ffmpeg_executable,
+)
 from applications.profiling import PerformanceProfiler
 from applications.video_probe import ImageioFfmpegVideoProbe
 
@@ -119,17 +123,33 @@ class VideoRenderer:
         fast_copy_when_unchanged: bool = True,
         keyframe_locator: KeyframeLocator | None = None,
         ffmpeg_executable: str | None = None,
+        ffmpeg_capabilities: FfmpegCapabilities | None = None,
+        hardware_acceleration: str = "auto",
         profiler: PerformanceProfiler | None = None,
     ) -> None:
         self.input_path = input_path
         self.output_path = output_path
         self.codec = str(codec or "auto").strip()
         self.fast_copy_when_unchanged = bool(fast_copy_when_unchanged)
-        self.ffmpeg_executable = ffmpeg_executable or get_ffmpeg_exe()
+        self.hardware_acceleration = str(hardware_acceleration or "auto").casefold()
+        if ffmpeg_executable is None or ffmpeg_capabilities is None:
+            resolved_executable, resolved_capabilities = resolve_ffmpeg_executable(
+                ffmpeg_executable, prefer_hardware=self.hardware_acceleration != "none"
+            )
+            self.ffmpeg_executable = resolved_executable
+            self.ffmpeg_capabilities = resolved_capabilities
+        else:
+            self.ffmpeg_executable = ffmpeg_executable
+            self.ffmpeg_capabilities = ffmpeg_capabilities
         self.keyframe_locator = keyframe_locator or FfmpegKeyframeLocator(
             self.ffmpeg_executable
         )
         self.profiler = profiler
+        if self.profiler is not None:
+            self.profiler.configure(
+                render_ffmpeg_executable=self.ffmpeg_executable,
+                render_nvenc_available=self.ffmpeg_capabilities.supports_h264_nvenc,
+            )
 
     def remove_stale_output(self) -> None:
         try:
@@ -143,9 +163,18 @@ class VideoRenderer:
         if self.codec.casefold() == "copy":
             return ["copy"]
         if self.codec.casefold() in {"", "auto"}:
-            return ["libx264"]
+            candidates: list[str] = []
+            if (
+                self.hardware_acceleration != "none"
+                and self.ffmpeg_capabilities.supports_h264_nvenc
+            ):
+                candidates.append("h264_nvenc")
+            candidates.append("libx264")
+            return candidates
         if self.codec.casefold() == "libx264":
             return ["libx264"]
+        if self.codec.casefold() == "h264_nvenc":
+            return ["h264_nvenc", "libx264"]
         return [self.codec, "libx264"]
 
     @staticmethod
@@ -193,6 +222,10 @@ class VideoRenderer:
                 errors="replace",
                 bufsize=1,
             )
+            if self.profiler is not None:
+                self.profiler.register_child_process(
+                    process.pid, role="ffmpeg_final_render", command=runtime_command
+                )
             if process.stdout is None:
                 raise RuntimeError("FFmpeg no expuso su canal de progreso.")
 
@@ -255,6 +288,8 @@ class VideoRenderer:
 
             return_code = process.wait()
             if return_code == 0 and os.path.isfile(self.output_path):
+                if self.profiler is not None:
+                    self.profiler.capture_system_sample(reason="ffmpeg_render_completed")
                 while completed_percent < 100:
                     bar.next()
                     completed_percent += 1
@@ -430,7 +465,20 @@ class VideoRenderer:
         if normalized == "libx265":
             return ["-c:v", "libx265", "-preset", "veryfast", "-crf", "20"]
         if normalized == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-b:v", "0"]
+            return [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-rc",
+                "vbr",
+                "-cq",
+                "19",
+                "-b:v",
+                "0",
+                "-spatial_aq",
+                "1",
+            ]
         return ["-c:v", encoder]
 
     def _build_exact_command(
@@ -609,7 +657,10 @@ class VideoRenderer:
                 )
             errors: list[str] = []
             expected_duration = self._expected_duration(intervals)
-            for encoder in self.codec_candidates():
+            encoder_candidates = self.codec_candidates()
+            if self.profiler is not None:
+                self.profiler.configure(render_encoder_candidates=encoder_candidates)
+            for encoder in encoder_candidates:
                 self.remove_stale_output()
                 command = self._build_exact_command(
                     filter_script_path,
@@ -638,6 +689,11 @@ class VideoRenderer:
                             encoder=encoder,
                         )
                     if valid_duration:
+                        if self.profiler is not None:
+                            self.profiler.configure(
+                                resolved_render_encoder=encoder,
+                                render_used_nvenc=encoder.casefold() == "h264_nvenc",
+                            )
                         return encoder, actual_duration
 
                     # A malformed timestamp graph must never be returned to the
@@ -686,6 +742,11 @@ class VideoRenderer:
                             encoder=encoder,
                         )
                     if valid_duration:
+                        if self.profiler is not None:
+                            self.profiler.configure(
+                                resolved_render_encoder=encoder,
+                                render_used_nvenc=encoder.casefold() == "h264_nvenc",
+                            )
                         return encoder, actual_duration
                     raise RuntimeError(
                         "La duración generada no coincide con la suma de los "

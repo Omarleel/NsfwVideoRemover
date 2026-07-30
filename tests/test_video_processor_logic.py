@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -33,7 +34,12 @@ if "progress.bar" not in sys.modules:
 
 from imageio_ffmpeg import get_ffmpeg_exe
 
-from applications.NsfwVideoProcessor import NsfwVideoProcessor, _FfmpegFramePipeline
+from applications.ffmpeg_capabilities import FfmpegCapabilities
+from applications.NsfwVideoProcessor import (
+    NsfwVideoProcessor,
+    _FfmpegDecodeError,
+    _FfmpegFramePipeline,
+)
 from applications.SrtGenerator import SrtGenerator
 from applications.detectors.base import DetectionAssessment
 from applications.reporting import AnalysisReportWriter
@@ -140,6 +146,82 @@ class ProcessorLogicTests(unittest.TestCase):
         )
         command = pipeline._command()
         self.assertIn("scale=1280:720:flags=fast_bilinear", command[command.index("-vf") + 1])
+
+
+    def test_cuda_sampling_command_keeps_scale_on_gpu_until_after_selection(self) -> None:
+        capabilities = FfmpegCapabilities(
+            executable="ffmpeg",
+            hwaccels=frozenset({"cuda"}),
+            filters=frozenset({"scale_cuda"}),
+            encoders=frozenset({"h264_nvenc"}),
+        )
+        pipeline = _FfmpegFramePipeline(
+            video_path="input.mp4",
+            width=1280,
+            height=720,
+            clip_duration=1.0,
+            segments=[{"orden": 1}],
+            prefetch_frames=8,
+            ffmpeg_threads=4,
+            resize_frames=True,
+            ffmpeg_executable="ffmpeg",
+            ffmpeg_capabilities=capabilities,
+            hardware_acceleration="cuda",
+        )
+        command = pipeline._command(hardware=True)
+        self.assertIn("-hwaccel", command)
+        self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
+        filter_text = command[command.index("-vf") + 1]
+        self.assertLess(filter_text.index("select="), filter_text.index("scale_cuda="))
+        self.assertLess(filter_text.index("scale_cuda="), filter_text.index("hwdownload"))
+
+    def test_hardware_decode_failure_retries_complete_pipeline_on_cpu(self) -> None:
+        processor = self._processor(
+            detector=DummyDetector(),
+            hardware_acceleration="auto",
+            profile_enabled=False,
+        )
+        attempts: list[str] = []
+        frame = np.zeros((32, 64, 3), dtype=np.uint8)
+        segment = {
+            "orden": 1,
+            "intervalo": [0.0, 1.0],
+            "detecciones": None,
+            "nsfw": None,
+        }
+
+        class FakePipeline:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.hardware_acceleration = kwargs["hardware_acceleration"]
+                attempts.append(self.hardware_acceleration)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def __iter__(self):
+                if self.hardware_acceleration != "none":
+                    raise _FfmpegDecodeError("simulated NVDEC failure", hardware=True)
+                yield segment, frame
+
+        with patch(
+            "applications.NsfwVideoProcessor._FfmpegFramePipeline",
+            FakePipeline,
+        ):
+            results = processor._analyze_with_pipeline(
+                [segment],
+                detector=DummyDetector(),
+                width=64,
+                height=32,
+                workers=1,
+                active_device="cpu",
+                resize_frames=False,
+            )
+
+        self.assertEqual(attempts, ["auto", "none"])
+        self.assertEqual(len(results), 1)
 
     def test_analysis_dimensions_preserve_aspect_ratio(self) -> None:
         processor = self._processor(analysis_max_dimension=1280)
@@ -311,6 +393,56 @@ class FfmpegSamplingIntegrationTests(unittest.TestCase):
 
             self.assertEqual(len(frames), 1)
             self.assertEqual(frames[0][1].shape, (32, 64, 3))
+
+    def test_sampler_reuses_last_frame_when_audio_outlasts_video(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = str(Path(directory) / "audio-longer-than-video.mp4")
+            command = [
+                get_ffmpeg_exe(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=30:d=1.8",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000:duration=2.2",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                video_path,
+            ]
+            result = subprocess.run(command, check=False, capture_output=True)
+            if result.returncode != 0:
+                self.skipTest("El FFmpeg disponible no puede crear video+audio sintético.")
+
+            info = ImageioFfmpegVideoProbe().probe(video_path)
+            self.assertGreater(info.duration, 2.0)
+            segments = SegmentPlanner(1.0).build(info.duration)
+            with _FfmpegFramePipeline(
+                video_path=video_path,
+                width=64,
+                height=64,
+                clip_duration=1.0,
+                segments=segments,
+                prefetch_frames=2,
+                ffmpeg_threads=1,
+            ) as pipeline:
+                frames = list(pipeline)
+
+            self.assertEqual(len(frames), len(segments))
+            self.assertTrue(np.array_equal(frames[-1][1], frames[-2][1]))
 
     def test_decimal_segments_match_real_ffmpeg_frames(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

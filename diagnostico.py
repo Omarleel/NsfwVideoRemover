@@ -76,8 +76,25 @@ def print_common_info() -> None:
         "pillow",
         "imageio-ffmpeg",
         "opencv-python-headless",
+        "psutil",
+        "nvidia-ml-py",
     ):
         print(f"{package}: {package_version(package)}")
+    try:
+        from applications.ffmpeg_capabilities import resolve_ffmpeg_executable
+
+        executable, capabilities = resolve_ffmpeg_executable(prefer_hardware=True)
+        print(f"FFmpeg seleccionado: {executable}")
+        print(
+            "FFmpeg hardware: "
+            f"CUDA={capabilities.supports_cuda_decode}; "
+            f"scale_cuda={capabilities.supports_cuda_scale}; "
+            f"h264_nvenc={capabilities.supports_h264_nvenc}"
+        )
+        if capabilities.probe_errors:
+            print(f"Advertencias FFmpeg: {list(capabilities.probe_errors)}")
+    except Exception as exc:
+        print(f"ERROR diagnosticando FFmpeg: {exc}")
 
 
 def diagnose_nudenet(*, require_cuda: bool) -> int:

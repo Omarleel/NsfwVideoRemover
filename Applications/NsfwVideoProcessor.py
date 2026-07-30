@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
 
 import numpy as np
-from imageio_ffmpeg import get_ffmpeg_exe
 from progress.bar import ChargingBar
 
 from applications.constants import (
@@ -29,6 +28,10 @@ from applications.detectors import (
     DetectionAssessment,
     DetectorConfig,
     create_detector,
+)
+from applications.ffmpeg_capabilities import (
+    FfmpegCapabilities,
+    resolve_ffmpeg_executable,
 )
 from applications.profiling import PerformanceProfiler, current_rss_bytes
 from applications.reporting import AnalysisReportWriter
@@ -51,6 +54,19 @@ class _PipelineFailure:
 
     def __init__(self, error: BaseException) -> None:
         self.error = error
+
+
+class _FfmpegDecodeError(RuntimeError):
+    """Failure raised by the FFmpeg frame producer.
+
+    ``hardware`` allows the coordinator to retry the complete analysis through
+    the software path without mistaking detector/inference failures for decode
+    failures.
+    """
+
+    def __init__(self, message: str, *, hardware: bool) -> None:
+        super().__init__(message)
+        self.hardware = bool(hardware)
 
 
 def _initialize_detector_worker(
@@ -231,7 +247,7 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes:
 
 
 class _FfmpegFramePipeline:
-    """Decode sampled frames once and feed inference through a bounded queue."""
+    """Decode sampled frames once, preferring NVDEC/scale_cuda when available."""
 
     def __init__(
         self,
@@ -244,6 +260,9 @@ class _FfmpegFramePipeline:
         ffmpeg_threads: int,
         resize_frames: bool = False,
         profiler: PerformanceProfiler | None = None,
+        ffmpeg_executable: str | None = None,
+        ffmpeg_capabilities: FfmpegCapabilities | None = None,
+        hardware_acceleration: str = "none",
     ) -> None:
         self.video_path = video_path
         self.width = int(width)
@@ -254,47 +273,174 @@ class _FfmpegFramePipeline:
         self.ffmpeg_threads = max(1, int(ffmpeg_threads))
         self.resize_frames = bool(resize_frames)
         self.profiler = profiler
+        if ffmpeg_executable is None or ffmpeg_capabilities is None:
+            resolved_executable, resolved_capabilities = resolve_ffmpeg_executable(
+                ffmpeg_executable, prefer_hardware=True
+            )
+            self.ffmpeg_executable = resolved_executable
+            self.ffmpeg_capabilities = resolved_capabilities
+        else:
+            self.ffmpeg_executable = ffmpeg_executable
+            self.ffmpeg_capabilities = ffmpeg_capabilities
+        self.hardware_acceleration = str(hardware_acceleration or "none").casefold()
+        self.resolved_decode_mode = "software"
         self._queue: queue.Queue[
             tuple[dict[str, Any], np.ndarray] | _PipelineFailure | object
         ] = queue.Queue(maxsize=self.prefetch_frames)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._process: subprocess.Popen[bytes] | None = None
+        self._queue_put_count = 0
+        self._queue_get_count = 0
+        self._queue_get_started_empty_count = 0
+        self._queue_full_retry_count = 0
+        self._queue_max_size = 0
+        self._queue_size_sum_after_put = 0
+        self._producer_wait_seconds = 0.0
+        self._consumer_wait_seconds = 0.0
 
-    def _command(self) -> list[str]:
+    def _sample_filter(self, *, hardware: bool) -> str:
         sample_filter = (
             "setpts=PTS-STARTPTS,"
             f"select=eq(n\\,0)+gte(t\\,selected_n*{self.clip_duration:.12g})"
         )
-        if self.resize_frames:
+        if hardware:
+            # Keep 4K frames on the GPU until after sampling and scaling. Only the
+            # selected 1280x720 frames cross PCIe and are converted to RGB on CPU.
             sample_filter += (
-                f",scale={self.width}:{self.height}:flags=fast_bilinear"
+                f",scale_cuda={self.width}:{self.height}:format=nv12:"
+                "interp_algo=bilinear,hwdownload,format=nv12,format=rgb24"
             )
-        return [
-            get_ffmpeg_exe(),
+        elif self.resize_frames:
+            sample_filter += f",scale={self.width}:{self.height}:flags=fast_bilinear"
+        return sample_filter
+
+    def _command(self, *, hardware: bool = False) -> list[str]:
+        command = [
+            self.ffmpeg_executable,
             "-hide_banner",
             "-loglevel",
             "error",
             "-nostdin",
             "-threads",
             str(self.ffmpeg_threads),
-            "-i",
-            self.video_path,
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            sample_filter,
-            "-frames:v",
-            str(len(self.segments)),
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
         ]
+        if hardware:
+            command.extend(
+                [
+                    "-hwaccel",
+                    "cuda",
+                    "-hwaccel_output_format",
+                    "cuda",
+                    "-extra_hw_frames",
+                    str(max(8, self.prefetch_frames + 4)),
+                ]
+            )
+        command.extend(
+            [
+                "-i",
+                self.video_path,
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                self._sample_filter(hardware=hardware),
+                "-frames:v",
+                str(len(self.segments)),
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]
+        )
+        return command
+
+    def _hardware_requested(self) -> bool:
+        return (
+            self.hardware_acceleration in {"auto", "cuda"}
+            and self.ffmpeg_capabilities.supports_nvdec_pipeline
+        )
+
+    def _validate_hardware_command(self, command: list[str]) -> tuple[bool, str]:
+        output_index = command.index("-f", command.index("-frames:v"))
+        probe = list(command[:output_index])
+        frames_index = probe.index("-frames:v") + 1
+        probe[frames_index] = "1"
+        probe.extend(["-f", "null", "-"])
+        started = time.perf_counter()
+        cpu_started = time.process_time()
+        offset = self.profiler.now_offset_seconds() if self.profiler else None
+        try:
+            result = subprocess.run(
+                probe,
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+            message = result.stderr.decode("utf-8", errors="replace").strip()
+            valid = result.returncode == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            valid = False
+            message = f"{type(exc).__name__}: {exc}"
+        if self.profiler is not None:
+            self.profiler.event(
+                "decode",
+                "validate_cuda_decode_pipeline",
+                duration_seconds=time.perf_counter() - started,
+                cpu_seconds=time.process_time() - cpu_started,
+                start_offset_seconds=offset,
+                valid=valid,
+                command=probe,
+                error=message or None,
+            )
+        return valid, message
+
+    def _select_command(self) -> list[str]:
+        if self._hardware_requested():
+            hardware_command = self._command(hardware=True)
+            valid, message = self._validate_hardware_command(hardware_command)
+            if valid:
+                self.resolved_decode_mode = "cuda_nvdec_scale_cuda"
+                print("Decodificación de análisis: NVDEC + scale_cuda (fallback activo).")
+                return hardware_command
+            print(
+                "NVDEC/scale_cuda no pudo inicializarse; usando decodificación CPU."
+                + (f" Detalle: {message}" if message else "")
+            )
+        elif self.hardware_acceleration == "cuda":
+            print(
+                "El FFmpeg seleccionado no expone CUDA + scale_cuda; "
+                "usando decodificación CPU."
+            )
+        self.resolved_decode_mode = "software"
+        return self._command(hardware=False)
+
+    def queue_metrics(self) -> dict[str, Any]:
+        put_count = max(1, self._queue_put_count)
+        get_count = max(1, self._queue_get_count)
+        empty_ratio = self._queue_get_started_empty_count / get_count
+        queue_starved = empty_ratio >= 0.50 and self._queue_full_retry_count == 0
+        return {
+            "queue_capacity": self.prefetch_frames,
+            "queue_put_count": self._queue_put_count,
+            "queue_get_count": self._queue_get_count,
+            "queue_full_retry_count": self._queue_full_retry_count,
+            "queue_max_size": self._queue_max_size,
+            "average_queue_size_after_put": self._queue_size_sum_after_put / put_count,
+            "consumer_started_with_empty_queue_ratio": empty_ratio,
+            "queue_starved": queue_starved,
+            "worker_scaling_decision": (
+                "keep_single_worker_queue_starved"
+                if queue_starved
+                else "backpressure_detected_explicit_workers_may_help"
+            ),
+            "producer_wait_seconds": self._producer_wait_seconds,
+            "consumer_wait_seconds": self._consumer_wait_seconds,
+            "resolved_decode_mode": self.resolved_decode_mode,
+        }
 
     def _put(
         self,
@@ -305,6 +451,7 @@ class _FfmpegFramePipeline:
                 self._queue.put(item, timeout=0.1)
                 return True
             except queue.Full:
+                self._queue_full_retry_count += 1
                 continue
         return False
 
@@ -312,7 +459,7 @@ class _FfmpegFramePipeline:
         frame_size = self.width * self.height * 3
         stderr_file = tempfile.TemporaryFile(mode="w+b")
         try:
-            command = self._command()
+            command = self._select_command()
             launch_started = time.perf_counter()
             launch_cpu = time.process_time()
             launch_offset = (
@@ -324,6 +471,13 @@ class _FfmpegFramePipeline:
                 stderr=stderr_file,
                 bufsize=max(frame_size * 2, 1024 * 1024),
             )
+            if self.profiler is not None:
+                self.profiler.register_child_process(
+                    self._process.pid, role="ffmpeg_analysis_decode", command=command
+                )
+                self.profiler.configure(
+                    resolved_analysis_decode_mode=self.resolved_decode_mode
+                )
             if self.profiler is not None:
                 self.profiler.event(
                     "decode",
@@ -338,7 +492,8 @@ class _FfmpegFramePipeline:
             if self._process.stdout is None:
                 raise RuntimeError("FFmpeg no expuso el flujo de frames.")
 
-            for segment in self.segments:
+            last_complete_raw_frame: bytes | None = None
+            for segment_index, segment in enumerate(self.segments):
                 if self._stop_event.is_set():
                     return
                 segment_order = segment.get("orden")
@@ -362,16 +517,55 @@ class _FfmpegFramePipeline:
                     self.profiler.increment("decoded_frame_bytes", len(raw_frame))
                 if len(raw_frame) != frame_size:
                     return_code = self._process.wait(timeout=10)
-                    stderr_file.seek(0)
-                    details = stderr_file.read().decode("utf-8", errors="replace").strip()
-                    message = (
-                        "FFmpeg terminó antes de producir todos los frames "
-                        f"(código {return_code})."
-                    )
-                    if details:
-                        message += f" Detalle: {details}"
-                    raise RuntimeError(message)
+                    missing_frames = len(self.segments) - segment_index
+                    clean_eof = return_code == 0 and len(raw_frame) == 0
+                    # Container/audio duration can be a few milliseconds longer
+                    # than the video stream. In that normal case FFmpeg produces
+                    # every requested sample except the final one and exits 0.
+                    # Reusing the nearest available video frame is more accurate
+                    # than failing a complete multi-minute analysis at 99 %.
+                    if (
+                        clean_eof
+                        and missing_frames == 1
+                        and last_complete_raw_frame is not None
+                    ):
+                        raw_frame = last_complete_raw_frame
+                        if self.profiler is not None:
+                            self.profiler.event(
+                                "decode",
+                                "reuse_last_frame_for_trailing_segment",
+                                segment_order=segment_order,
+                                missing_frames=missing_frames,
+                                return_code=return_code,
+                                reason="container_or_audio_duration_exceeds_video_stream",
+                                resolved_decode_mode=self.resolved_decode_mode,
+                            )
+                            self.profiler.increment("reused_trailing_analysis_frames")
+                        print(
+                            "Aviso: la pista de video terminó antes que la duración "
+                            "del contenedor; se reutilizó el último frame para el "
+                            "segmento final."
+                        )
+                    else:
+                        stderr_file.seek(0)
+                        details = (
+                            stderr_file.read()
+                            .decode("utf-8", errors="replace")
+                            .strip()
+                        )
+                        message = (
+                            "FFmpeg terminó antes de producir todos los frames "
+                            f"(código {return_code}; faltantes={missing_frames}; "
+                            f"bytes parciales={len(raw_frame)})."
+                        )
+                        if details:
+                            message += f" Detalle: {details}"
+                        raise _FfmpegDecodeError(
+                            message,
+                            hardware=self.resolved_decode_mode.startswith("cuda"),
+                        )
 
+                last_complete_raw_frame = raw_frame
                 convert_started = time.perf_counter()
                 convert_cpu = time.process_time()
                 convert_offset = (
@@ -396,11 +590,18 @@ class _FfmpegFramePipeline:
                     self.profiler.now_offset_seconds() if self.profiler is not None else None
                 )
                 accepted = self._put((segment, frame))
+                put_duration = time.perf_counter() - put_started
+                self._producer_wait_seconds += put_duration
+                if accepted:
+                    self._queue_put_count += 1
+                    queue_size = self._queue.qsize()
+                    self._queue_size_sum_after_put += queue_size
+                    self._queue_max_size = max(self._queue_max_size, queue_size)
                 if self.profiler is not None:
                     self.profiler.event(
                         "queue",
                         "producer_put_wait",
-                        duration_seconds=time.perf_counter() - put_started,
+                        duration_seconds=put_duration,
                         cpu_seconds=time.process_time() - put_cpu,
                         start_offset_seconds=put_offset,
                         segment_order=segment_order,
@@ -429,8 +630,9 @@ class _FfmpegFramePipeline:
             if return_code != 0 and not self._stop_event.is_set():
                 stderr_file.seek(0)
                 details = stderr_file.read().decode("utf-8", errors="replace").strip()
-                raise RuntimeError(
-                    f"FFmpeg falló durante la decodificación (código {return_code}). {details}"
+                raise _FfmpegDecodeError(
+                    f"FFmpeg falló durante la decodificación (código {return_code}). {details}",
+                    hardware=self.resolved_decode_mode.startswith("cuda"),
                 )
         except BaseException as exc:
             self._put(_PipelineFailure(exc))
@@ -464,20 +666,29 @@ class _FfmpegFramePipeline:
             get_offset = (
                 self.profiler.now_offset_seconds() if self.profiler is not None else None
             )
+            started_empty = self._queue.empty()
             item = self._queue.get()
+            get_duration = time.perf_counter() - get_started
+            self._consumer_wait_seconds += get_duration
+            self._queue_get_count += 1
+            if started_empty:
+                self._queue_get_started_empty_count += 1
             if self.profiler is not None:
                 self.profiler.event(
                     "queue",
                     "consumer_get_wait",
-                    duration_seconds=time.perf_counter() - get_started,
+                    duration_seconds=get_duration,
                     cpu_seconds=time.process_time() - get_cpu,
                     start_offset_seconds=get_offset,
                     queue_size_after_get=self._queue.qsize(),
                     sentinel=item is _FRAME_SENTINEL,
+                    started_with_empty_queue=started_empty,
                 )
             if item is _FRAME_SENTINEL:
                 break
             if isinstance(item, _PipelineFailure):
+                if isinstance(item.error, _FfmpegDecodeError):
+                    raise item.error
                 raise RuntimeError("Falló la etapa de decodificación.") from item.error
             segment, frame = item
             yield segment, frame
@@ -489,6 +700,11 @@ class _FfmpegFramePipeline:
             process.terminate()
         if self._thread is not None:
             self._thread.join(timeout=10)
+        if self.profiler is not None:
+            metrics = self.queue_metrics()
+            self.profiler.configure(**metrics)
+            self.profiler.event("queue", "pipeline_queue_summary", **metrics)
+            self.profiler.capture_system_sample(reason="analysis_pipeline_closed")
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.close()
@@ -520,6 +736,8 @@ class NsfwVideoProcessor:
         analyze_only: bool = False,
         profile_enabled: bool = True,
         profile_output_path: str = "",
+        ffmpeg_executable: str = "",
+        hardware_acceleration: str = "auto",
         detector_config: DetectorConfig | None = None,
         detector: ContentDetector | None = None,
         detector_factory: DetectorBuilder = create_detector,
@@ -560,6 +778,16 @@ class NsfwVideoProcessor:
         self.fast_copy_when_unchanged = bool(fast_copy_when_unchanged)
         self.analyze_only = bool(analyze_only)
         self.profile_enabled = bool(profile_enabled)
+        normalized_hardware = str(hardware_acceleration or "auto").casefold()
+        if normalized_hardware not in {"auto", "cuda", "none"}:
+            raise ValueError("hardware_acceleration debe ser auto, cuda o none.")
+        self.hardware_acceleration = normalized_hardware
+        (
+            self.ffmpeg_executable,
+            self.ffmpeg_capabilities,
+        ) = resolve_ffmpeg_executable(
+            ffmpeg_executable or None, prefer_hardware=self.hardware_acceleration != "none"
+        )
 
         self.detector_config = detector_config or DetectorConfig(
             backend=detector_backend,
@@ -614,6 +842,9 @@ class NsfwVideoProcessor:
             output_path=self.output_video_path,
             codec=self.codec,
             fast_copy_when_unchanged=self.fast_copy_when_unchanged,
+            ffmpeg_executable=self.ffmpeg_executable,
+            ffmpeg_capabilities=self.ffmpeg_capabilities,
+            hardware_acceleration=self.hardware_acceleration,
             profiler=self.profiler,
         )
         if renderer is not None and hasattr(self.renderer, "profiler"):
@@ -632,6 +863,15 @@ class NsfwVideoProcessor:
             model_id=self.detector_config.model_id,
             nudenet_aggregation=self.detector_config.nudenet_aggregation,
             analyze_only=self.analyze_only,
+            requested_hardware_acceleration=self.hardware_acceleration,
+            ffmpeg_executable=self.ffmpeg_executable,
+            ffmpeg_supports_cuda_decode=self.ffmpeg_capabilities.supports_cuda_decode,
+            ffmpeg_supports_scale_cuda=self.ffmpeg_capabilities.supports_cuda_scale,
+            ffmpeg_supports_h264_nvenc=self.ffmpeg_capabilities.supports_h264_nvenc,
+            ffmpeg_capability_probe_errors=list(self.ffmpeg_capabilities.probe_errors),
+            worker_policy=(
+                "explicit" if self.requested_workers > 0 else "single_until_queue_backpressure"
+            ),
         )
         self.profiler.artifact("analysis_json", self.output_report_path)
         self.profiler.artifact("srt", self.output_srt_path)
@@ -651,13 +891,10 @@ class NsfwVideoProcessor:
             return 1
         if self.requested_workers > 0:
             return min(self.requested_workers, number_of_segments)
-        if active_device == "cuda":
-            return 1
-        cpu_count = os.cpu_count() or 1
-        decode_threads = self._resolve_ffmpeg_threads("cpu")
-        inference_threads = max(1, cpu_count - decode_threads)
-        worker_capacity = max(1, inference_threads // 2)
-        return max(1, min(4, worker_capacity, number_of_segments))
+        # Automatic mode starts with one worker. Increasing workers while the
+        # producer queue is empty only duplicates models and IPC without adding
+        # throughput. Users can still request a fixed count explicitly.
+        return 1
 
     def _resolve_analysis_dimensions(self, width: int, height: int) -> tuple[int, int]:
         """Bound decoded frame size before Python/IPC without changing aspect ratio."""
@@ -967,34 +1204,57 @@ class NsfwVideoProcessor:
             f"prefetch={prefetch_frames} frames; lote={batch_size}; "
             f"threads FFmpeg={ffmpeg_threads}"
         )
-        with _FfmpegFramePipeline(
-            video_path=self.video_path,
-            width=width,
-            height=height,
-            clip_duration=self.clip_duration,
-            segments=segments,
-            prefetch_frames=prefetch_frames,
-            ffmpeg_threads=ffmpeg_threads,
-            resize_frames=resize_frames,
-            profiler=self.profiler,
-        ) as frame_pipeline:
-            if workers == 1:
-                if detector is None:
-                    raise RuntimeError("No existe una sesión local de inferencia.")
-                return self._analyze_sequential_pipeline(
+        def run_pipeline(hardware_acceleration: str) -> list[dict[str, Any]]:
+            with _FfmpegFramePipeline(
+                video_path=self.video_path,
+                width=width,
+                height=height,
+                clip_duration=self.clip_duration,
+                segments=segments,
+                prefetch_frames=prefetch_frames,
+                ffmpeg_threads=ffmpeg_threads,
+                resize_frames=resize_frames,
+                profiler=self.profiler,
+                ffmpeg_executable=self.ffmpeg_executable,
+                ffmpeg_capabilities=self.ffmpeg_capabilities,
+                hardware_acceleration=hardware_acceleration,
+            ) as frame_pipeline:
+                if workers == 1:
+                    if detector is None:
+                        raise RuntimeError("No existe una sesión local de inferencia.")
+                    return self._analyze_sequential_pipeline(
+                        frame_pipeline,
+                        detector,
+                        batch_size=batch_size,
+                        number_of_segments=len(segments),
+                    )
+                return self._analyze_parallel_pipeline(
                     frame_pipeline,
-                    detector,
+                    workers=workers,
+                    active_device=active_device,
                     batch_size=batch_size,
                     number_of_segments=len(segments),
+                    ffmpeg_threads=ffmpeg_threads,
                 )
-            return self._analyze_parallel_pipeline(
-                frame_pipeline,
-                workers=workers,
-                active_device=active_device,
-                batch_size=batch_size,
-                number_of_segments=len(segments),
-                ffmpeg_threads=ffmpeg_threads,
+
+        try:
+            return run_pipeline(self.hardware_acceleration)
+        except _FfmpegDecodeError as exc:
+            if not exc.hardware:
+                raise RuntimeError("Falló la etapa de decodificación por CPU.") from exc
+            print(
+                "NVDEC falló durante el análisis; reintentando automáticamente "
+                f"con decodificación CPU. Detalle: {exc}"
             )
+            self.profiler.event(
+                "decode",
+                "retry_analysis_with_software_decode",
+                error=str(exc),
+                previous_mode="cuda_nvdec_scale_cuda",
+                retry_mode="software",
+            )
+            self.profiler.increment("hardware_decode_fallbacks")
+            return run_pipeline("none")
 
     def _build_cut_intervals(
         self,
@@ -1140,6 +1400,13 @@ class NsfwVideoProcessor:
                 source_height=height,
                 source_pixels=width * height,
             )
+            print(
+                "FFmpeg seleccionado: "
+                f"{self.ffmpeg_executable} "
+                f"(CUDA={'sí' if self.ffmpeg_capabilities.supports_cuda_decode else 'no'}, "
+                f"scale_cuda={'sí' if self.ffmpeg_capabilities.supports_cuda_scale else 'no'}, "
+                f"NVENC={'sí' if self.ffmpeg_capabilities.supports_h264_nvenc else 'no'})."
+            )
 
             with self.profiler.span("planning", "resolve_analysis_dimensions"):
                 analysis_width, analysis_height = self._resolve_analysis_dimensions(
@@ -1260,6 +1527,7 @@ class NsfwVideoProcessor:
             raise
         finally:
             self.profiler.configure(final_rss_bytes=current_rss_bytes())
+            self.profiler.capture_system_sample(reason="process_video_finally")
             try:
                 self.profiler.write(status=status)
                 if self.profiler.enabled:
