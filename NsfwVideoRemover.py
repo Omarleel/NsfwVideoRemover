@@ -4,6 +4,7 @@ import argparse
 import multiprocessing as mp
 
 from applications.constants import (
+    DEFAULT_ANALYSIS_MAX_DIMENSION,
     DEFAULT_CLIP_DURATION,
     DEFAULT_COVERED_THRESHOLD,
     DEFAULT_CUT_PADDING_SECONDS,
@@ -65,6 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Duración en segundos de cada segmento analizado.",
     )
     parser.add_argument(
+        "--analysis-max-dimension",
+        type=int,
+        default=DEFAULT_ANALYSIS_MAX_DIMENSION,
+        help=(
+            "Reduce los frames antes de enviarlos al detector. 0 conserva la "
+            f"resolución original (por defecto: {DEFAULT_ANALYSIS_MAX_DIMENSION}px)."
+        ),
+    )
+    parser.add_argument(
         "--exposed-threshold",
         type=float,
         default=DEFAULT_EXPOSED_THRESHOLD,
@@ -112,8 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--codec",
         default="auto",
         help=(
-            "Codec de salida. auto intenta h264_nvenc con NVIDIA y usa "
-            "libx264 como fallback."
+            "Encoder de salida cuando existen cortes. 'auto' usa libx264 con "
+            "cortes exactos; 'copy' prioriza velocidad, pero puede perder GOP "
+            "sanos en los bordes. También admite h264_nvenc u otro encoder FFmpeg."
         ),
     )
     parser.add_argument(
@@ -131,7 +142,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force-reencode",
         action="store_true",
-        help="Recodifica incluso cuando no hay cortes.",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--profile-output",
+        default="",
+        help=(
+            "Ruta del JSON de perfilado atómico. Por defecto usa "
+            "<video>.profile.json junto al video."
+        ),
+    )
+    parser.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="Desactiva el profiler detallado para medir el rendimiento sin instrumentación.",
     )
     parser.add_argument(
         "--analyze-only",
@@ -152,6 +176,7 @@ def main() -> None:
         umbral_minimo_cubierto=args.covered_threshold,
         output_folder_path=args.output_dir,
         clip_duration=args.clip_duration,
+        analysis_max_dimension=args.analysis_max_dimension,
         num_procesos=args.workers,
         device=args.device,
         codec=args.codec,
@@ -165,6 +190,8 @@ def main() -> None:
         nsfw_threshold=args.nsfw_threshold,
         nudenet_aggregation=args.nudenet_aggregation,
         analyze_only=args.analyze_only,
+        profile_enabled=not args.no_profile,
+        profile_output_path=args.profile_output,
     )
     processor.process_video()
 

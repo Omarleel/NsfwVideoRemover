@@ -74,7 +74,7 @@ def print_common_info() -> None:
         "torch",
         "transformers",
         "pillow",
-        "moviepy",
+        "imageio-ffmpeg",
         "opencv-python-headless",
     ):
         print(f"{package}: {package_version(package)}")

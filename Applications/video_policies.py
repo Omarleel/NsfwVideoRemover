@@ -54,15 +54,21 @@ class CutIntervalPolicy:
         duration: float,
         padding_seconds: float | None = None,
     ) -> list[tuple[float, float]]:
-        padding = self.padding_seconds if padding_seconds is None else max(0.0, float(padding_seconds))
+        padding = (
+            self.padding_seconds
+            if padding_seconds is None
+            else max(0.0, float(padding_seconds))
+        )
         duration = max(0.0, float(duration))
         raw: list[tuple[float, float]] = []
         for result in results:
             if not result.get("nsfw"):
                 continue
-            detection_time = float(result["intervalo"][0])
-            start = round(max(0.0, detection_time - padding), 12)
-            end = round(min(duration, detection_time + padding), 12)
+            interval_start, interval_end = result["intervalo"]
+            detected_start = max(0.0, float(interval_start))
+            detected_end = min(duration, max(detected_start, float(interval_end)))
+            start = round(max(0.0, detected_start - padding), 12)
+            end = round(min(duration, detected_end + padding), 12)
             if end > start:
                 raw.append((start, end))
         if not raw:
