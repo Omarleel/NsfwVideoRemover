@@ -114,6 +114,16 @@ class ProcessorLogicTests(unittest.TestCase):
         self.assertGreaterEqual(prefetch, 2)
         self.assertLessEqual(prefetch * 3840 * 2160 * 3, 256 * 1024 * 1024)
 
+    def test_huggingface_detector_recommendation_controls_auto_batch(self) -> None:
+        class RecommendedDetector(DummyDetector):
+            recommended_batch_size = 16
+
+        detector = RecommendedDetector()
+        processor = self._processor(detector=detector, detector_backend="huggingface")
+        batch = processor._resolve_batch_size(1280, 720, 1, "cuda", detector=detector)
+        self.assertEqual(batch, 16)
+        self.assertEqual(processor._resolve_prefetch_frames(1280, 720, 1, batch), 16)
+
     def test_ffmpeg_pipeline_uses_one_sequential_sampler(self) -> None:
         pipeline = _FfmpegFramePipeline(
             video_path="input.mp4",
@@ -174,6 +184,29 @@ class ProcessorLogicTests(unittest.TestCase):
         filter_text = command[command.index("-vf") + 1]
         self.assertLess(filter_text.index("select="), filter_text.index("scale_cuda="))
         self.assertLess(filter_text.index("scale_cuda="), filter_text.index("hwdownload"))
+
+    def test_cuda_decoder_surfaces_are_not_tied_to_large_inference_prefetch(self) -> None:
+        capabilities = FfmpegCapabilities(
+            executable="ffmpeg",
+            hwaccels=frozenset({"cuda"}),
+            filters=frozenset({"scale_cuda"}),
+            encoders=frozenset({"h264_nvenc"}),
+        )
+        pipeline = _FfmpegFramePipeline(
+            video_path="input.mp4",
+            width=1280,
+            height=720,
+            clip_duration=1.0,
+            segments=[{"orden": 1}],
+            prefetch_frames=32,
+            ffmpeg_threads=8,
+            resize_frames=True,
+            ffmpeg_executable="ffmpeg",
+            ffmpeg_capabilities=capabilities,
+            hardware_acceleration="cuda",
+        )
+        command = pipeline._command(hardware=True)
+        self.assertEqual(command[command.index("-extra_hw_frames") + 1], "12")
 
     def test_hardware_decode_failure_retries_complete_pipeline_on_cpu(self) -> None:
         processor = self._processor(

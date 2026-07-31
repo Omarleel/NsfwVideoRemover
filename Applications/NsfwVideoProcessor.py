@@ -333,7 +333,12 @@ class _FfmpegFramePipeline:
                     "-hwaccel_output_format",
                     "cuda",
                     "-extra_hw_frames",
-                    str(max(8, self.prefetch_frames + 4)),
+                    # Decoder surfaces are independent from the Python prefetch
+                    # queue. Tying both values made large Falconsai batches request
+                    # an invalid CUVID surface count on some drivers/codecs. Twelve
+                    # is the previously validated value and still leaves enough
+                    # headroom for H.264 reordering without wasting VRAM.
+                    str(min(12, max(8, self.prefetch_frames + 4))),
                 ]
             )
         command.extend(
@@ -914,13 +919,29 @@ class NsfwVideoProcessor:
         height: int,
         workers: int,
         active_device: str,
+        detector: ContentDetector | None = None,
     ) -> int:
         if self.requested_batch_size > 0:
             return self.requested_batch_size
         frame_bytes = max(1, int(width) * int(height) * 3)
-        target_bytes = 128 * 1024 * 1024 if workers == 1 else 32 * 1024 * 1024
+        target_bytes = 192 * 1024 * 1024 if workers == 1 else 32 * 1024 * 1024
         memory_limited = max(1, target_bytes // frame_bytes)
-        preferred = 4 if active_device == "cuda" or workers == 1 else 8
+
+        detector_recommendation = 0
+        if workers == 1 and detector is not None:
+            try:
+                detector_recommendation = int(
+                    getattr(detector, "recommended_batch_size", 0) or 0
+                )
+            except (TypeError, ValueError):
+                detector_recommendation = 0
+
+        if detector_recommendation > 0:
+            preferred = detector_recommendation
+        elif self.detector_config.backend == "huggingface" and active_device == "cuda":
+            preferred = 16
+        else:
+            preferred = 4 if active_device == "cuda" or workers == 1 else 8
         return max(1, min(preferred, memory_limited))
 
     def _resolve_prefetch_frames(
@@ -934,8 +955,10 @@ class NsfwVideoProcessor:
             return self.requested_prefetch_frames
         frame_bytes = max(1, int(width) * int(height) * 3)
         memory_limited = max(2, (256 * 1024 * 1024) // frame_bytes)
-        desired = max(4, workers * batch_size * 2)
-        return max(2, min(32, memory_limited, desired))
+        # One complete inference batch is enough to keep the consumer fed.
+        # Extra full-resolution frames only increase RAM once inference is the bottleneck.
+        desired = max(8, workers * batch_size)
+        return max(2, min(48, memory_limited, desired))
 
     @staticmethod
     def _resolve_ffmpeg_threads(active_device: str) -> int:
@@ -1185,7 +1208,13 @@ class NsfwVideoProcessor:
         active_device: str,
         resize_frames: bool,
     ) -> list[dict[str, Any]]:
-        batch_size = self._resolve_batch_size(width, height, workers, active_device)
+        batch_size = self._resolve_batch_size(
+            width,
+            height,
+            workers,
+            active_device,
+            detector=detector,
+        )
         prefetch_frames = self._resolve_prefetch_frames(width, height, workers, batch_size)
         ffmpeg_threads = self._resolve_ffmpeg_threads(active_device)
         self.profiler.configure(
@@ -1198,6 +1227,12 @@ class NsfwVideoProcessor:
             analysis_height=height,
             analysis_frame_bytes=width * height * 3,
             analysis_resize_applied=resize_frames,
+            **(
+                detector.performance_metadata()
+                if detector is not None
+                and callable(getattr(detector, "performance_metadata", None))
+                else {}
+            ),
         )
         print(
             "Pipeline: "
@@ -1238,7 +1273,7 @@ class NsfwVideoProcessor:
                 )
 
         try:
-            return run_pipeline(self.hardware_acceleration)
+            results = run_pipeline(self.hardware_acceleration)
         except _FfmpegDecodeError as exc:
             if not exc.hardware:
                 raise RuntimeError("Falló la etapa de decodificación por CPU.") from exc
@@ -1254,7 +1289,13 @@ class NsfwVideoProcessor:
                 retry_mode="software",
             )
             self.profiler.increment("hardware_decode_fallbacks")
-            return run_pipeline("none")
+            results = run_pipeline("none")
+
+        if detector is not None and callable(
+            getattr(detector, "performance_metadata", None)
+        ):
+            self.profiler.configure(**detector.performance_metadata())
+        return results
 
     def _build_cut_intervals(
         self,

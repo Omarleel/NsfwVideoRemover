@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nsfw-video-remover"
-version = "2.5.1"
+version = "2.6.1"
 description = "Video analysis and cutting pipeline with interchangeable image detectors."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,8 +22,9 @@ nudenet-cpu = [
   "onnxruntime>=1.21,<1.27",
   "nudenet==3.4.2",
 ]
+# PyTorch is intentionally installed by instalar.py from the correct CPU/CUDA
+# index. Keeping a generic torch requirement here can downgrade CUDA to +cpu.
 huggingface = [
-  "torch>=2.2,<3",
   "transformers>=4.40,<6",
   "pillow>=10,<13",
   "safetensors>=0.4,<1",

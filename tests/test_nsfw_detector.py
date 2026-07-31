@@ -179,6 +179,114 @@ class FakeClassifier:
         return self.outputs
 
 
+
+
+class FakeTensor:
+    def __init__(self, values: Any) -> None:
+        import numpy as np
+
+        self.values = np.asarray(values, dtype=float)
+
+    @property
+    def shape(self):
+        return self.values.shape
+
+    def pin_memory(self):
+        return self
+
+    def is_pinned(self) -> bool:
+        return True
+
+    def to(self, *_args: Any, **_kwargs: Any):
+        return self
+
+    def detach(self):
+        return self
+
+    def float(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return self.values.tolist()
+
+
+class FakeTorch:
+    class FakeOutOfMemoryError(RuntimeError):
+        pass
+
+    class cuda:
+        OutOfMemoryError = None
+
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+        @staticmethod
+        def empty_cache() -> None:
+            return None
+
+    cuda.OutOfMemoryError = FakeOutOfMemoryError
+
+    @staticmethod
+    def inference_mode():
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    @staticmethod
+    def softmax(tensor: FakeTensor, dim: int = -1) -> FakeTensor:
+        import numpy as np
+
+        values = tensor.values
+        shifted = values - values.max(axis=dim, keepdims=True)
+        exp = np.exp(shifted)
+        return FakeTensor(exp / exp.sum(axis=dim, keepdims=True))
+
+
+class FakeImageProcessor:
+    def __call__(self, *, images: list[Any], return_tensors: str):
+        self.last_count = len(images)
+        self.last_images = list(images)
+        self.return_tensors = return_tensors
+        return {"pixel_values": FakeTensor([[index] for index in range(len(images))])}
+
+
+class FakeDirectModel:
+    def __init__(self, *, fail_above: int = 0) -> None:
+        self.config = types.SimpleNamespace(id2label={0: "normal", 1: "nsfw"})
+        self.fail_above = fail_above
+        self.batch_calls: list[int] = []
+        self.eval_called = False
+        self.float_called = False
+        self.device = None
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def float(self):
+        self.float_called = True
+        return self
+
+    def requires_grad_(self, _enabled: bool):
+        return self
+
+    def to(self, device: str):
+        self.device = device
+        return self
+
+    def __call__(self, *, pixel_values: FakeTensor):
+        count = len(pixel_values.values)
+        self.batch_calls.append(count)
+        if self.fail_above and count > self.fail_above:
+            raise RuntimeError("CUDA out of memory")
+        logits = [[0.0, 2.0] if index % 2 == 0 else [2.0, 0.0] for index in range(count)]
+        return types.SimpleNamespace(logits=FakeTensor(logits))
+
+
 class HuggingFaceDetectorTests(unittest.TestCase):
     def test_binary_predictions_are_normalized(self) -> None:
         classifier = FakeClassifier(
@@ -216,6 +324,109 @@ class HuggingFaceDetectorTests(unittest.TestCase):
         )
         assessment = detector._assessment([{"label": "NSFW", "score": 0.5}])
         self.assertTrue(assessment.is_nsfw)
+
+    def test_direct_fp32_backend_batches_without_transformers_pipeline(self) -> None:
+        processor = FakeImageProcessor()
+        model = FakeDirectModel()
+        detector = HuggingFaceImageDetector(
+            "example/model",
+            nsfw_threshold=0.5,
+            device="cpu",
+            image_processor=processor,
+            model=model,
+            torch_module=FakeTorch,
+        )
+        images = [
+            __import__("numpy").zeros((8, 8, 3), dtype="uint8"),
+            __import__("numpy").ones((8, 8, 3), dtype="uint8"),
+        ]
+        results = detector.analyze_batch(images, batch_size=2)
+        self.assertEqual(model.batch_calls, [2])
+        self.assertTrue(model.eval_called)
+        self.assertTrue(model.float_called)
+        self.assertEqual(model.device, "cpu")
+        self.assertEqual(detector.inference_engine, "direct_fp32")
+        self.assertTrue(results[0].is_nsfw)
+        self.assertFalse(results[1].is_nsfw)
+        self.assertAlmostEqual(results[0].score, 0.8807970779, places=6)
+        self.assertTrue(all(getattr(image, "mode", None) == "RGB" for image in processor.last_images))
+
+    def test_read_only_ffmpeg_array_is_converted_to_rgb_pil(self) -> None:
+        import numpy as np
+
+        raw = bytes([0, 1, 2] * 16)
+        read_only = np.frombuffer(raw, dtype=np.uint8).reshape((4, 4, 3))
+        self.assertFalse(read_only.flags.writeable)
+        converted = HuggingFaceImageDetector._to_processor_image(read_only)
+        self.assertEqual(converted.mode, "RGB")
+        self.assertEqual(converted.size, (4, 4))
+
+    def test_runtime_batch_size_keeps_largest_successful_batch(self) -> None:
+        processor = FakeImageProcessor()
+        detector = HuggingFaceImageDetector(
+            "example/model",
+            device="cpu",
+            image_processor=processor,
+            model=FakeDirectModel(),
+            torch_module=FakeTorch,
+        )
+        import numpy as np
+
+        detector.analyze_batch([np.zeros((4, 4, 3), dtype="uint8") for _ in range(4)], batch_size=4)
+        detector.analyze_batch([np.zeros((4, 4, 3), dtype="uint8")], batch_size=4)
+        self.assertEqual(detector.runtime_batch_size, 4)
+
+    def test_direct_backend_halves_batch_after_oom(self) -> None:
+        model = FakeDirectModel(fail_above=2)
+        detector = HuggingFaceImageDetector(
+            "example/model",
+            device="cpu",
+            image_processor=FakeImageProcessor(),
+            model=model,
+            torch_module=FakeTorch,
+        )
+        images = [__import__("numpy").zeros((4, 4, 3), dtype="uint8") for _ in range(4)]
+        results = detector.analyze_batch(images, batch_size=4)
+        self.assertEqual(len(results), 4)
+        self.assertEqual(model.batch_calls, [4, 2, 2])
+        self.assertEqual(detector.runtime_batch_size, 2)
+        self.assertEqual(detector.oom_fallback_count, 1)
+
+    def test_production_loader_prefers_local_cache(self) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeAutoImageProcessor:
+            @staticmethod
+            def from_pretrained(_model_id: str, **kwargs: Any):
+                calls.append(("processor", dict(kwargs)))
+                return FakeImageProcessor()
+
+        class FakeAutoModel:
+            @staticmethod
+            def from_pretrained(_model_id: str, **kwargs: Any):
+                calls.append(("model", dict(kwargs)))
+                return FakeDirectModel()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoImageProcessor = FakeAutoImageProcessor
+        fake_transformers.AutoModelForImageClassification = FakeAutoModel
+        original = sys.modules.get("transformers")
+        sys.modules["transformers"] = fake_transformers
+        try:
+            detector = HuggingFaceImageDetector(
+                "example/model",
+                device="cpu",
+                torch_module=FakeTorch,
+            )
+        finally:
+            if original is None:
+                sys.modules.pop("transformers", None)
+            else:
+                sys.modules["transformers"] = original
+
+        self.assertEqual(detector.model_load_source, "local_cache")
+        self.assertEqual([name for name, _kwargs in calls], ["processor", "model"])
+        self.assertTrue(all(kwargs.get("local_files_only") for _name, kwargs in calls))
 
 
 class FactoryTests(unittest.TestCase):

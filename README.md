@@ -73,12 +73,52 @@ python NsfwVideoRemover.py video.mp4 --detector huggingface --analyze-only
 
 ---
 
+## ⚡ Falconsai optimizado (v2.6.1)
+
+El backend Hugging Face ya no utiliza `transformers.pipeline` durante producción. Carga directamente `AutoImageProcessor` y `AutoModelForImageClassification`, ejecuta el modelo bajo `torch.inference_mode()` y conserva precisión FP32.
+
+La selección automática de lote usa la VRAM libre después de cargar el modelo:
+
+- 12 GiB o más libres: lote 32.
+- 6 GiB o más: lote 16.
+- 3 GiB o más: lote 8.
+- Menos de 3 GiB: lote 4.
+
+Si otra aplicación ocupa VRAM y el lote elegido falla, se reduce automáticamente a la mitad y se reintenta sin abortar el video. Se mantiene un solo worker para no duplicar el modelo en la GPU.
+
+El modelo y el procesador se buscan primero en la caché local. Solo se consulta Hugging Face Hub cuando faltan archivos, por lo que las ejecuciones posteriores evitan una comprobación de red innecesaria.
+
+Ejemplo conservador:
+
+```bash
+python NsfwVideoRemover.py video.mp4 \
+  --detector huggingface \
+  --device auto \
+  --nsfw-threshold 0.15 \
+  --clip-duration 0.5 \
+  --hardware-accel auto \
+  --codec auto
+```
+
+La consola informa `motor=direct_fp32`, `carga=local_cache` y el lote recomendado. `--batch-size N` sigue permitiendo fijar manualmente el lote para pruebas comparativas.
+
+El profiler añade:
+
+- `detector_inference_engine`
+- `detector_precision`
+- `detector_model_load_source`
+- `detector_recommended_batch_size`
+- `detector_runtime_batch_size`
+- `detector_oom_fallback_count`
+
+Estas optimizaciones no cambian el modelo, el umbral, la frecuencia de muestreo ni la resolución que recibe el preprocesador oficial.
+
 ## ⚙️ Optimización y Rendimiento
 
 El sistema está diseñado para maximizar la eficiencia en la extracción de frames y el uso de memoria:
 - **Selección automática de FFmpeg:** compara el binario indicado con `--ffmpeg`, `NSFW_FFMPEG`, el FFmpeg del sistema e `imageio-ffmpeg`. En modo automático prioriza el que anuncie NVDEC, `scale_cuda` y NVENC.
 - **NVDEC + `scale_cuda`:** con `--hardware-accel auto`, los frames 4K permanecen en la GPU durante decodificación, muestreo y escalado. Solo los frames seleccionados y ya reducidos cruzan a RAM. Antes de iniciar se ejecuta una prueba real; cualquier incompatibilidad cae automáticamente a la ruta CPU.
-- **Canalización eficiente:** FFmpeg abre un único decodificador y produce frames RGB ordenados en una cola acotada (~256 MiB o 32 frames), evitando múltiples procesos o búsquedas independientes.
+- **Canalización eficiente:** FFmpeg abre un único decodificador y produce frames RGB ordenados en una cola acotada (hasta ~256 MiB o 48 frames), evitando múltiples procesos o búsquedas independientes.
 - **Reducción previa al modelo:** los frames grandes se escalan dentro de FFmpeg antes de entrar a Python. El valor predeterminado limita el lado mayor a 1280 px; `--analysis-max-dimension 0` conserva la resolución original.
 - **Workers guiados por la cola:** `--workers 0` conserva un solo worker. No duplica modelos mientras el consumidor siga esperando una cola vacía. El profiler registra `queue_starved`, ocupación, bloqueos y una recomendación; un número fijo mayor solo se usa cuando se solicita explícitamente.
 - **Lotes (`--batch-size`):** Calculado automáticamente según resolución, dispositivo y costo de IPC.
@@ -226,6 +266,13 @@ Las pruebas cubren fallbacks, presupuestos de ONNX, combinaciones de intervalos,
 - Cada segmento marcado se elimina completo. `--cut-padding` solo amplía el corte antes del inicio y después del final del segmento; con `--cut-padding 0` todavía se elimina el segmento detectado.
 - Si el informe muestra cortes más amplios de lo deseado, reduce `--cut-padding`; el renderizador no añade pérdida extra en modo `auto`.
 - Cada modelo de Hugging Face usa etiquetas distintas. Lee la *Model Card* antes de cambiar `--model-id`.
+
+
+### Corrección 2.6.1: NVDEC con batches grandes y equivalencia del preprocesado
+
+- El tamaño de la cola/lote de Falconsai ya no aumenta `-extra_hw_frames`; el decoder CUDA usa un máximo validado de 12 superficies y conserva el fallback CPU.
+- La inferencia directa convierte cada muestra a RGB PIL igual que el pipeline anterior. Esto elimina el aviso de arrays NumPy de solo lectura y evita variaciones de score por usar otro backend de redimensionamiento.
+- `detector_runtime_batch_size` registra el mayor lote realmente ejecutado, no el tamaño del último lote incompleto.
 
 ## Corrección 2.4.1: final de pista y fallback NVDEC
 
