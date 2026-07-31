@@ -7,4 +7,4 @@ else
 fi
 "$PYTHON" -m venv .venv
 . .venv/bin/activate
-python instalar.py --detector huggingface --auto
+python instalar.py --detector freepik --auto

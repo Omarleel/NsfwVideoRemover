@@ -9,4 +9,4 @@ if %errorlevel%==0 (
 if errorlevel 1 exit /b 1
 call .venv\Scripts\activate.bat
 if errorlevel 1 exit /b 1
-python instalar.py --detector huggingface --auto
+python instalar.py --detector freepik --auto

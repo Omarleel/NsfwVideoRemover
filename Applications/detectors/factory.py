@@ -62,10 +62,14 @@ class DetectorFactory:
             from applications.detectors.nudenet import NudeNetDetector
 
             cls.register("nudenet", NudeNetDetector.from_config)
-        if "huggingface" not in cls._builders:
-            from applications.detectors.huggingface import HuggingFaceImageDetector
+        if "falconsai" not in cls._builders:
+            from applications.detectors.falconsai import FalconsaiImageDetector
 
-            cls.register("huggingface", HuggingFaceImageDetector.from_config)
+            cls.register("falconsai", FalconsaiImageDetector.from_config)
+        if "freepik" not in cls._builders:
+            from applications.detectors.freepik import FreepikImageDetector
+
+            cls.register("freepik", FreepikImageDetector.from_config)
 
 
 def create_detector(config: DetectorConfig) -> ContentDetector:

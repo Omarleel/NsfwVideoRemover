@@ -57,6 +57,8 @@ class AnalysisReportWriter:
         video_path: str,
         duration: float,
         detector_name: str,
+        detector_provider: str | None = None,
+        model_id: str | None = None,
         results: list[dict[str, Any]],
         cut_intervals: list[tuple[float, float]],
         srt_path: str,
@@ -125,6 +127,8 @@ class AnalysisReportWriter:
             "video": str(Path(video_path)),
             "duration_seconds": float(duration),
             "detector": detector_name,
+            "provider": detector_provider,
+            "model_id": model_id,
             "cut_intervals": [[start, end] for start, end in cut_intervals],
             "allowed_intervals": [
                 [start, end] for start, end in (allowed_intervals or [])

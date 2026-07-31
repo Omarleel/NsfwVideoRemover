@@ -7,6 +7,8 @@ from typing import Any
 
 from applications.detectors.config import DetectorConfig
 from applications.detectors.factory import DetectorFactory
+from applications.detectors.freepik import FreepikImageDetector
+from applications.detectors.falconsai import FalconsaiImageDetector
 from applications.detectors.huggingface import HuggingFaceImageDetector
 from applications.detectors.nudenet import NudeNetDetector
 
@@ -427,6 +429,100 @@ class HuggingFaceDetectorTests(unittest.TestCase):
         self.assertEqual(detector.model_load_source, "local_cache")
         self.assertEqual([name for name, _kwargs in calls], ["processor", "model"])
         self.assertTrue(all(kwargs.get("local_files_only") for _name, kwargs in calls))
+
+
+    def test_generic_id2label_falls_back_to_label_names(self) -> None:
+        model = FakeDirectModel()
+        model.config = types.SimpleNamespace(
+            id2label={0: "LABEL_0", 1: "LABEL_1"},
+            label_names=["neutral", "high"],
+        )
+        detector = HuggingFaceImageDetector(
+            "example/model",
+            device="cpu",
+            image_processor=FakeImageProcessor(),
+            model=model,
+            torch_module=FakeTorch,
+        )
+        self.assertEqual(detector._label_for_index(0), "neutral")
+        self.assertEqual(detector._label_for_index(1), "high")
+
+
+class FreepikDetectorTests(unittest.TestCase):
+    def _detector(self, outputs, **thresholds):
+        detector = FreepikImageDetector(
+            classifier=FakeClassifier(outputs),
+            device="cpu",
+            **thresholds,
+        )
+        detector._to_pipeline_image = lambda image: image  # type: ignore[method-assign]
+        return detector
+
+    def test_cumulative_unsafe_threshold_is_inclusive(self) -> None:
+        detector = self._detector(
+            [[
+                {"label": "neutral", "score": 0.80},
+                {"label": "low", "score": 0.12},
+                {"label": "medium", "score": 0.05},
+                {"label": "high", "score": 0.03},
+            ]],
+            unsafe_threshold=0.20,
+            medium_high_threshold=0.90,
+            high_threshold=0.90,
+        )
+        result = detector.analyze_batch([object()], batch_size=1)[0]
+        self.assertTrue(result.is_nsfw)
+        self.assertAlmostEqual(result.score, 0.20)
+        self.assertAlmostEqual(result.metrics["medium_high"], 0.08)
+        self.assertIn("low+medium+high", result.reason or "")
+
+    def test_high_guardrail_catches_small_but_strong_high_signal(self) -> None:
+        detector = self._detector(
+            [[
+                {"label": "neutral", "score": 0.93},
+                {"label": "low", "score": 0.00},
+                {"label": "medium", "score": 0.01},
+                {"label": "high", "score": 0.06},
+            ]],
+            unsafe_threshold=0.90,
+            medium_high_threshold=0.90,
+            high_threshold=0.05,
+        )
+        result = detector.analyze_batch([object()], batch_size=1)[0]
+        self.assertTrue(result.is_nsfw)
+        self.assertIn("high=0.060", result.reason or "")
+
+    def test_neutral_prediction_preserves_all_metrics(self) -> None:
+        detector = self._detector(
+            [[
+                {"label": "neutral", "score": 0.98},
+                {"label": "low", "score": 0.01},
+                {"label": "medium", "score": 0.005},
+                {"label": "high", "score": 0.005},
+            ]]
+        )
+        result = detector.analyze_batch([object()], batch_size=1)[0]
+        self.assertFalse(result.is_nsfw)
+        self.assertEqual(
+            set(result.metrics),
+            {"neutral", "low", "medium", "high", "unsafe", "medium_high"},
+        )
+
+    def test_config_selects_freepik_model_automatically(self) -> None:
+        config = DetectorConfig(backend="freepik")
+        self.assertEqual(config.model_id, "Freepik/nsfw_image_detector")
+
+    def test_falconsai_factory_uses_canonical_detector_name(self) -> None:
+        detector = FalconsaiImageDetector(
+            "example/model",
+            device="cpu",
+            classifier=FakeClassifier([]),
+        )
+        self.assertEqual(detector.name, "falconsai")
+
+    def test_nudenet_does_not_default_to_falconsai_model(self) -> None:
+        config = DetectorConfig(backend="nudenet")
+        self.assertEqual(config.model_id, "NudeNet")
 
 
 class FactoryTests(unittest.TestCase):

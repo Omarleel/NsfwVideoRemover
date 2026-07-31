@@ -9,8 +9,11 @@ from applications.constants import (
     DEFAULT_COVERED_THRESHOLD,
     DEFAULT_CUT_PADDING_SECONDS,
     DEFAULT_EXPOSED_THRESHOLD,
-    DEFAULT_HUGGINGFACE_MODEL,
+    DEFAULT_FREEPIK_HIGH_THRESHOLD,
+    DEFAULT_FREEPIK_MEDIUM_HIGH_THRESHOLD,
+    DEFAULT_FREEPIK_UNSAFE_THRESHOLD,
     DEFAULT_NSFW_THRESHOLD,
+    SUPPORTED_DETECTOR_NAMES,
 )
 from applications.NsfwVideoProcessor import NsfwVideoProcessor
 
@@ -35,16 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--detector",
-        choices=("nudenet", "huggingface"),
+        choices=SUPPORTED_DETECTOR_NAMES,
         default="nudenet",
-        help="Backend de clasificación. NudeNet se mantiene por compatibilidad.",
+        help="Backend de clasificación: nudenet, falconsai o freepik.",
     )
     parser.add_argument(
         "--model-id",
-        default=DEFAULT_HUGGINGFACE_MODEL,
+        default="",
         help=(
-            "Modelo compatible con image-classification cuando se usa "
-            "--detector huggingface."
+            "Modelo compatible con image-classification. Vacío selecciona "
+            "Falconsai/nsfw_image_detection para falconsai y "
+            "Freepik/nsfw_image_detector para freepik."
         ),
     )
     parser.add_argument(
@@ -100,6 +104,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_NSFW_THRESHOLD,
         help="Umbral de la clase NSFW para detectores de clasificación.",
+    )
+    parser.add_argument(
+        "--freepik-unsafe-threshold",
+        type=float,
+        default=DEFAULT_FREEPIK_UNSAFE_THRESHOLD,
+        help=(
+            "Freepik: corta cuando low+medium+high alcanza este valor "
+            f"(por defecto: {DEFAULT_FREEPIK_UNSAFE_THRESHOLD:.2f})."
+        ),
+    )
+    parser.add_argument(
+        "--freepik-medium-high-threshold",
+        type=float,
+        default=DEFAULT_FREEPIK_MEDIUM_HIGH_THRESHOLD,
+        help=(
+            "Freepik: corta cuando medium+high alcanza este valor "
+            f"(por defecto: {DEFAULT_FREEPIK_MEDIUM_HIGH_THRESHOLD:.2f})."
+        ),
+    )
+    parser.add_argument(
+        "--freepik-high-threshold",
+        type=float,
+        default=DEFAULT_FREEPIK_HIGH_THRESHOLD,
+        help=(
+            "Freepik: corta cuando high alcanza este valor "
+            f"(por defecto: {DEFAULT_FREEPIK_HIGH_THRESHOLD:.2f})."
+        ),
     )
     parser.add_argument(
         "--cut-padding",
@@ -206,6 +237,9 @@ def main() -> None:
         model_id=args.model_id,
         nsfw_threshold=args.nsfw_threshold,
         nudenet_aggregation=args.nudenet_aggregation,
+        freepik_unsafe_threshold=args.freepik_unsafe_threshold,
+        freepik_medium_high_threshold=args.freepik_medium_high_threshold,
+        freepik_high_threshold=args.freepik_high_threshold,
         analyze_only=args.analyze_only,
         profile_enabled=not args.no_profile,
         profile_output_path=args.profile_output,

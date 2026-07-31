@@ -10,6 +10,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from applications.constants import (
+    SUPPORTED_DETECTOR_NAMES,
+    default_model_for_backend,
+    normalize_detector_backend,
+)
+
 
 ROOT = Path(__file__).resolve().parent
 ORT_VERSION = "1.23.2"
@@ -95,6 +101,7 @@ def diagnostic_command(
     model_id: str,
     load_model: bool = False,
 ) -> list[str]:
+    detector = normalize_detector_backend(detector)
     command = [
         python,
         str(ROOT / "diagnostico.py"),
@@ -193,10 +200,11 @@ def install_pytorch_runtime(
         )
 
 
-def install_huggingface(
+def install_transformers_backend(
     pip: list[str],
     python: str,
     *,
+    detector: str,
     requested_profile: str,
     run_diagnostics: bool,
     model_id: str,
@@ -209,21 +217,11 @@ def install_huggingface(
             raise SystemExit("PyTorch CUDA solo se instala automáticamente en Windows o Linux.")
         selected = "cpu"
 
-    print(f"Perfil Hugging Face seleccionado: {selected}")
-    # Instala primero dependencias que no son torch; torch se instala desde su índice
-    # oficial específico para evitar que PyPI elija una rueda CPU-only.
+    print(f"Perfil de clasificadores Transformers seleccionado: {selected}")
     run(pip + ["install", "--upgrade", "-r", str(ROOT / "requirements-common.txt")])
-    run(
-        pip
-        + [
-            "install",
-            "--upgrade",
-            "transformers>=4.40,<6",
-            "pillow>=10,<13",
-            "safetensors>=0.4,<1",
-        ]
-    )
 
+    # PyTorch se instala antes de timm. De lo contrario, la dependencia transitiva
+    # de timm puede hacer que pip elija una rueda CPU-only desde PyPI.
     try:
         install_pytorch_runtime(pip, python, selected_profile=selected)
     except (subprocess.CalledProcessError, RuntimeError) as exc:
@@ -251,15 +249,29 @@ def install_huggingface(
         else:
             raise
 
+    # Con el runtime CUDA/CPU correcto ya validado, estas dependencias pueden
+    # resolverse sin sustituir PyTorch por una variante incompatible.
+    run(
+        pip
+        + [
+            "install",
+            "--upgrade",
+            "transformers>=4.40,<6",
+            "pillow>=10,<13",
+            "safetensors>=0.4,<1",
+            "timm>=1.0,<2",
+        ]
+    )
+
     if not run_diagnostics:
-        print("\nInstalación Hugging Face completada sin diagnóstico.")
+        print(f"\nInstalación {detector} completada sin diagnóstico.")
         return
 
     require_cuda = selected == "nvidia"
     code = run(
         diagnostic_command(
             python,
-            detector="huggingface",
+            detector=detector,
             require_cuda=require_cuda,
             model_id=model_id,
             load_model=True,
@@ -268,14 +280,15 @@ def install_huggingface(
     ).returncode
     if code != 0:
         raise SystemExit(
-            "La instalación terminó, pero el diagnóstico Hugging Face no pasó. "
+            f"La instalación terminó, pero el diagnóstico {detector} no pasó. "
             "Revisa la salida anterior."
         )
     print(
-        "\nInstalación Hugging Face validada. "
+        f"\nInstalación {detector} validada. "
         f"Dispositivo seleccionado: {selected}. El modelo se descargará en la "
         "primera ejecución o con diagnostico.py --load-model."
     )
+
 
 
 def install_nudenet(
@@ -383,10 +396,12 @@ def install(
     pip = [python, "-m", "pip"]
     run(pip + ["install", "--upgrade", "pip"])
 
-    if detector == "huggingface":
-        install_huggingface(
+    detector = normalize_detector_backend(detector)
+    if detector in {"falconsai", "freepik"}:
+        install_transformers_backend(
             pip,
             python,
+            detector=detector,
             requested_profile=profile,
             run_diagnostics=run_diagnostics,
             model_id=model_id,
@@ -401,7 +416,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--detector",
-        choices=("nudenet", "huggingface"),
+        choices=SUPPORTED_DETECTOR_NAMES,
         default="nudenet",
         help="Backend que se instalará.",
     )
@@ -411,8 +426,11 @@ def main() -> None:
     profile.add_argument("--nvidia", dest="profile", action="store_const", const="nvidia")
     parser.add_argument(
         "--model-id",
-        default="Falconsai/nsfw_image_detection",
-        help="Modelo de Hugging Face usado por el diagnóstico opcional.",
+        default="",
+        help=(
+            "Modelo usado por el diagnóstico. Vacío selecciona Falconsai para "
+            "falconsai y Freepik/nsfw_image_detector para freepik."
+        ),
     )
     parser.add_argument(
         "--sin-diagnostico",
@@ -426,12 +444,13 @@ def main() -> None:
     )
     parser.set_defaults(profile="auto")
     args = parser.parse_args()
+    model_id = args.model_id.strip() or default_model_for_backend(args.detector)
     install(
         args.profile,
         args.detector,
         not args.sin_diagnostico,
         allow_global=args.permitir_entorno_global,
-        model_id=args.model_id,
+        model_id=model_id,
     )
 
 

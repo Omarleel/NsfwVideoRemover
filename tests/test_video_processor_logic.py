@@ -114,12 +114,12 @@ class ProcessorLogicTests(unittest.TestCase):
         self.assertGreaterEqual(prefetch, 2)
         self.assertLessEqual(prefetch * 3840 * 2160 * 3, 256 * 1024 * 1024)
 
-    def test_huggingface_detector_recommendation_controls_auto_batch(self) -> None:
+    def test_falconsai_detector_recommendation_controls_auto_batch(self) -> None:
         class RecommendedDetector(DummyDetector):
             recommended_batch_size = 16
 
         detector = RecommendedDetector()
-        processor = self._processor(detector=detector, detector_backend="huggingface")
+        processor = self._processor(detector=detector, detector_backend="falconsai")
         batch = processor._resolve_batch_size(1280, 720, 1, "cuda", detector=detector)
         self.assertEqual(batch, 16)
         self.assertEqual(processor._resolve_prefetch_frames(1280, 720, 1, batch), 16)
@@ -365,7 +365,9 @@ class ProcessorLogicTests(unittest.TestCase):
             writer.write(
                 video_path="input.mp4",
                 duration=1.0,
-                detector_name="dummy",
+                detector_name="falconsai",
+                detector_provider="huggingface",
+                model_id="Falconsai/nsfw_image_detection",
                 results=results,
                 cut_intervals=[],
                 srt_path=srt_path,
@@ -374,7 +376,9 @@ class ProcessorLogicTests(unittest.TestCase):
             writer.write(
                 video_path="input.mp4",
                 duration=1.0,
-                detector_name="dummy",
+                detector_name="falconsai",
+                detector_provider="huggingface",
+                model_id="Falconsai/nsfw_image_detection",
                 results=results,
                 cut_intervals=[],
                 srt_path=srt_path,
@@ -383,6 +387,9 @@ class ProcessorLogicTests(unittest.TestCase):
             self.assertEqual(Path(srt_path).read_text(encoding="utf-8").count("-->"), 1)
             report = json.loads(Path(json_path).read_text(encoding="utf-8"))
             self.assertEqual(report["schema_version"], 1)
+            self.assertEqual(report["detector"], "falconsai")
+            self.assertEqual(report["provider"], "huggingface")
+            self.assertEqual(report["model_id"], "Falconsai/nsfw_image_detection")
             self.assertEqual(len(report["segments"]), 1)
 
     def test_srt_time_rounding_carries_to_next_second(self) -> None:

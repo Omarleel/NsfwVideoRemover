@@ -1,0 +1,5 @@
+# Falconsai alojado en Hugging Face Hub. PyTorch se instala mediante instalar.py.
+-r requirements-common.txt
+transformers>=4.40,<6
+pillow>=10,<13
+safetensors>=0.4,<1

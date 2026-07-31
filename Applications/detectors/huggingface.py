@@ -26,7 +26,7 @@ class HuggingFaceImageDetector:
     tests and external integrations that inject a pipeline-like callable.
     """
 
-    name = "huggingface"
+    name = "transformers"
 
     def __init__(
         self,
@@ -81,7 +81,7 @@ class HuggingFaceImageDetector:
         except ImportError as exc:
             raise RuntimeError(
                 "El backend Hugging Face requiere torch, transformers y Pillow. "
-                "Instala requirements-huggingface.txt."
+                "Ejecuta instalar.py --detector falconsai o instala requirements-falconsai.txt."
             ) from exc
 
         if intra_op_threads > 0:
@@ -329,11 +329,17 @@ class HuggingFaceImageDetector:
         assert self.model is not None
         config = getattr(self.model, "config", None)
         id2label = getattr(config, "id2label", None)
+        fallback_label: str | None = None
         if isinstance(id2label, Mapping):
             label = id2label.get(index, id2label.get(str(index)))
             if label is not None:
-                return str(label)
-        return f"LABEL_{index}"
+                fallback_label = str(label)
+                if not fallback_label.upper().startswith("LABEL_"):
+                    return fallback_label
+        label_names = getattr(config, "label_names", None)
+        if isinstance(label_names, (list, tuple)) and 0 <= index < len(label_names):
+            return str(label_names[index])
+        return fallback_label or f"LABEL_{index}"
 
     def _move_inputs_to_device(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
         moved: dict[str, Any] = {}

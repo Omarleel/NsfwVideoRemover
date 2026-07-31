@@ -11,6 +11,12 @@ from pathlib import Path
 
 import numpy as np
 
+from applications.constants import (
+    SUPPORTED_DETECTOR_NAMES,
+    default_model_for_backend,
+    normalize_detector_backend,
+)
+
 
 def package_version(name: str) -> str:
     try:
@@ -78,6 +84,7 @@ def print_common_info() -> None:
         "opencv-python-headless",
         "psutil",
         "nvidia-ml-py",
+        "timm",
     ):
         print(f"{package}: {package_version(package)}")
     try:
@@ -137,8 +144,9 @@ def diagnose_nudenet(*, require_cuda: bool) -> int:
     return 0
 
 
-def diagnose_huggingface(
+def diagnose_transformers(
     *,
+    detector_backend: str,
     require_cuda: bool,
     load_model: bool,
     model_id: str,
@@ -147,8 +155,10 @@ def diagnose_huggingface(
         import torch
         import transformers  # noqa: F401
         from PIL import Image  # noqa: F401
+        if detector_backend == "freepik":
+            import timm  # noqa: F401
     except Exception as exc:
-        print(f"ERROR importando el backend Hugging Face: {exc}")
+        print(f"ERROR importando el backend {detector_backend}: {exc}")
         return 1
 
     cuda_available = bool(torch.cuda.is_available())
@@ -159,7 +169,7 @@ def diagnose_huggingface(
 
     if not load_model:
         print(
-            "OK: dependencias Hugging Face disponibles. Usa --load-model para "
+            "OK: dependencias de Transformers disponibles. Usa --load-model para "
             "descargar/cargar el modelo y ejecutar una inferencia en blanco."
         )
         return 0
@@ -171,29 +181,32 @@ def diagnose_huggingface(
         requested_device = "cuda" if require_cuda else "auto"
         detector = create_detector(
             DetectorConfig(
-                backend="huggingface",
+                backend=detector_backend,
                 device=requested_device,
                 model_id=model_id,
             )
         )
+        image_size = 448 if detector_backend == "freepik" else 224
         assessment = detector.analyze_batch(
-            [np.zeros((224, 224, 3), dtype=np.uint8)],
+            [np.zeros((image_size, image_size, 3), dtype=np.uint8)],
             batch_size=1,
         )[0]
-        print(f"Prueba real Hugging Face: {detector.provider_summary()}")
+        print(f"Prueba real {detector_backend}: {detector.provider_summary()}")
         print(
             "Resultado de imagen en blanco: "
-            f"nsfw={assessment.is_nsfw}; score={assessment.score:.4f}"
+            f"nsfw={assessment.is_nsfw}; score={assessment.score:.4f}; "
+            f"metricas={dict(assessment.metrics)}"
         )
     except Exception as exc:
-        print(f"ERROR cargando o ejecutando el modelo Hugging Face: {exc}")
+        print(f"ERROR cargando o ejecutando el modelo {detector_backend}: {exc}")
         return 1
 
     if require_cuda and detector.device != "cuda":
         print("ERROR: se exigió CUDA, pero el detector terminó en CPU.")
         return 2
-    print("OK: el modelo Hugging Face ejecutó una inferencia real.")
+    print(f"OK: el modelo {detector_backend} ejecutó una inferencia real.")
     return 0
+
 
 
 def main(
@@ -204,8 +217,10 @@ def main(
     model_id: str,
 ) -> int:
     print_common_info()
-    if detector == "huggingface":
-        return diagnose_huggingface(
+    detector = normalize_detector_backend(detector)
+    if detector in {"falconsai", "freepik"}:
+        return diagnose_transformers(
+            detector_backend=detector,
             require_cuda=require_cuda,
             load_model=load_model,
             model_id=model_id,
@@ -217,12 +232,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Comprueba los backends y aceleradores.")
     parser.add_argument(
         "--detector",
-        choices=("nudenet", "huggingface"),
+        choices=SUPPORTED_DETECTOR_NAMES,
         default="nudenet",
     )
     parser.add_argument(
         "--model-id",
-        default="Falconsai/nsfw_image_detection",
+        default="",
     )
     parser.add_argument(
         "--require-cuda",
@@ -232,9 +247,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-model",
         action="store_true",
-        help="En Hugging Face, descarga/carga el modelo y ejecuta una prueba real.",
+        help="En Transformers/Freepik, descarga el modelo y ejecuta una prueba real.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.model_id.strip():
+        args.model_id = default_model_for_backend(args.detector)
+    return args
 
 
 if __name__ == "__main__":

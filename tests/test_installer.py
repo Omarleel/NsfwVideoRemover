@@ -14,7 +14,7 @@ def test_conda_environment_is_accepted() -> None:
         assert instalar.is_virtual_environment() is True
 
 
-def test_auto_huggingface_selects_nvidia_and_cuda_index() -> None:
+def test_auto_falconsai_selects_nvidia_and_cuda_index() -> None:
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], *, check: bool = True):
@@ -35,9 +35,10 @@ def test_auto_huggingface_selects_nvidia_and_cuda_index() -> None:
             },
         ),
     ):
-        instalar.install_huggingface(
+        instalar.install_transformers_backend(
             [sys.executable, "-m", "pip"],
             sys.executable,
+            detector="falconsai",
             requested_profile="auto",
             run_diagnostics=False,
             model_id="test/model",
@@ -46,6 +47,13 @@ def test_auto_huggingface_selects_nvidia_and_cuda_index() -> None:
     torch_commands = [cmd for cmd in commands if "torch" in cmd]
     assert torch_commands
     assert instalar.PYTORCH_CUDA_INDEX in torch_commands[-1]
+    torch_index = next(i for i, command in enumerate(commands) if "torch" in command)
+    timm_index = next(
+        i
+        for i, command in enumerate(commands)
+        if any("timm>=" in item for item in command)
+    )
+    assert torch_index < timm_index
 
 
 def test_cuda_runtime_rejects_cpu_only_torch() -> None:
@@ -74,13 +82,25 @@ def test_cuda_runtime_rejects_cpu_only_torch() -> None:
             raise AssertionError("Debió rechazar una rueda CPU-only")
 
 
-def test_huggingface_diagnostic_loads_model() -> None:
+def test_falconsai_diagnostic_loads_model() -> None:
     command = instalar.diagnostic_command(
         sys.executable,
-        detector="huggingface",
+        detector="falconsai",
         require_cuda=True,
         model_id="test/model",
         load_model=True,
     )
     assert "--require-cuda" in command
     assert "--load-model" in command
+
+
+def test_freepik_diagnostic_selects_backend_and_model() -> None:
+    command = instalar.diagnostic_command(
+        sys.executable,
+        detector="freepik",
+        require_cuda=True,
+        model_id="Freepik/nsfw_image_detector",
+        load_model=True,
+    )
+    assert command[command.index("--detector") + 1] == "freepik"
+    assert command[command.index("--model-id") + 1] == "Freepik/nsfw_image_detector"

@@ -1,4 +1,4 @@
-# Perfil NudeNet CPU. Para Hugging Face usa requirements-huggingface.txt.
+# Perfil NudeNet CPU. Para Transformers/Freepik usa instalar.py para conservar PyTorch CUDA.
 -r requirements-common.txt
 onnxruntime>=1.21,<1.27
 nudenet==3.4.2

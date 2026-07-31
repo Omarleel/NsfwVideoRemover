@@ -21,7 +21,11 @@ from applications.constants import (
     DEFAULT_COVERED_THRESHOLD,
     DEFAULT_CUT_PADDING_SECONDS,
     DEFAULT_EXPOSED_THRESHOLD,
+    DEFAULT_FREEPIK_HIGH_THRESHOLD,
+    DEFAULT_FREEPIK_MEDIUM_HIGH_THRESHOLD,
+    DEFAULT_FREEPIK_UNSAFE_THRESHOLD,
     DEFAULT_NSFW_THRESHOLD,
+    provider_for_backend,
 )
 from applications.detectors import (
     ContentDetector,
@@ -735,9 +739,12 @@ class NsfwVideoProcessor:
         batch_size: int = 0,
         fast_copy_when_unchanged: bool = True,
         detector_backend: str = "nudenet",
-        model_id: str = "Falconsai/nsfw_image_detection",
+        model_id: str = "",
         nsfw_threshold: float = DEFAULT_NSFW_THRESHOLD,
         nudenet_aggregation: str = "max",
+        freepik_unsafe_threshold: float = DEFAULT_FREEPIK_UNSAFE_THRESHOLD,
+        freepik_medium_high_threshold: float = DEFAULT_FREEPIK_MEDIUM_HIGH_THRESHOLD,
+        freepik_high_threshold: float = DEFAULT_FREEPIK_HIGH_THRESHOLD,
         analyze_only: bool = False,
         profile_enabled: bool = True,
         profile_output_path: str = "",
@@ -802,6 +809,9 @@ class NsfwVideoProcessor:
             exposed_threshold=umbral_minimo_expuesto,
             covered_threshold=umbral_minimo_cubierto,
             nudenet_aggregation=nudenet_aggregation,
+            freepik_unsafe_threshold=freepik_unsafe_threshold,
+            freepik_medium_high_threshold=freepik_medium_high_threshold,
+            freepik_high_threshold=freepik_high_threshold,
         )
         self.device = self.detector_config.device
         self.umbral_minimo_expuesto = self.detector_config.exposed_threshold
@@ -811,7 +821,8 @@ class NsfwVideoProcessor:
         self._custom_factory = detector_factory is not create_detector
         self._external_backend = self.detector_config.backend not in {
             "nudenet",
-            "huggingface",
+            "falconsai",
+            "freepik",
         }
 
         self.segment_planner = segment_planner or SegmentPlanner(self.clip_duration)
@@ -867,6 +878,9 @@ class NsfwVideoProcessor:
             detector_backend=self.detector_config.backend,
             model_id=self.detector_config.model_id,
             nudenet_aggregation=self.detector_config.nudenet_aggregation,
+            freepik_unsafe_threshold=self.detector_config.freepik_unsafe_threshold,
+            freepik_medium_high_threshold=self.detector_config.freepik_medium_high_threshold,
+            freepik_high_threshold=self.detector_config.freepik_high_threshold,
             analyze_only=self.analyze_only,
             requested_hardware_acceleration=self.hardware_acceleration,
             ffmpeg_executable=self.ffmpeg_executable,
@@ -938,8 +952,8 @@ class NsfwVideoProcessor:
 
         if detector_recommendation > 0:
             preferred = detector_recommendation
-        elif self.detector_config.backend == "huggingface" and active_device == "cuda":
-            preferred = 16
+        elif self.detector_config.backend in {"falconsai", "freepik"} and active_device == "cuda":
+            preferred = 16 if self.detector_config.backend == "falconsai" else 8
         else:
             preferred = 4 if active_device == "cuda" or workers == 1 else 8
         return max(1, min(preferred, memory_limited))
@@ -1337,6 +1351,8 @@ class NsfwVideoProcessor:
         duration: float,
         cut_intervals: list[tuple[float, float]],
         detector_name: str,
+        detector_provider: str,
+        model_id: str,
     ) -> None:
         with self.profiler.span(
             "planning", "build_allowed_intervals", cut_interval_count=len(cut_intervals)
@@ -1355,6 +1371,8 @@ class NsfwVideoProcessor:
             "video_path": self.video_path,
             "duration": duration,
             "detector_name": detector_name,
+            "detector_provider": detector_provider,
+            "model_id": model_id,
             "results": results,
             "cut_intervals": cut_intervals,
             "allowed_intervals": allowed_intervals,
@@ -1559,8 +1577,20 @@ class NsfwVideoProcessor:
                 if local_detector is not None
                 else self.detector_config.backend
             )
+            detector_provider = provider_for_backend(detector_name)
+            detector_model_id = str(
+                getattr(local_detector, "model_id", self.detector_config.model_id)
+                or self.detector_config.model_id
+            )
             with self.profiler.span("output", "reports_and_render"):
-                self._render_results(results, duration, cut_intervals, detector_name)
+                self._render_results(
+                    results,
+                    duration,
+                    cut_intervals,
+                    detector_name,
+                    detector_provider,
+                    detector_model_id,
+                )
             status = "completed"
             return results
         except BaseException as exc:

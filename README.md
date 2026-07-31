@@ -22,17 +22,31 @@ python -m venv .venv
 **Instalar según el motor deseado:**
 - **NudeNet (CPU):** `python instalar.py --detector nudenet --cpu`
 - **NudeNet (NVIDIA auto):** `python instalar.py --detector nudenet --auto`
-- **Hugging Face (Auto):** `python instalar.py --detector huggingface --auto`
+- **Falconsai (Hugging Face, Auto):** `python instalar.py --detector falconsai --auto`
+- **Freepik EVA-02 (Auto):** `python instalar.py --detector freepik --auto`
 
-*(Para probar la carga del modelo de Hugging Face: `python diagnostico.py --detector huggingface --load-model`)*
+Pruebas reales de carga:
 
-### Instalación Hugging Face con GPU NVIDIA
+- `python diagnostico.py --detector falconsai --load-model`
+- `python diagnostico.py --detector freepik --load-model`
 
-`instalar.py --detector huggingface --auto` detecta `nvidia-smi`. Si existe una GPU NVIDIA utilizable, instala PyTorch desde el índice CUDA oficial y valida una inferencia real en GPU. En Conda ya no es necesario usar `--permitir-entorno-global` cuando `CONDA_PREFIX` coincide con el Python activo.
+### Instalación de clasificadores Transformers con GPU NVIDIA
 
-El instalador rechaza una rueda `+cpu` cuando se seleccionó NVIDIA y evita que `requirements-huggingface.txt` vuelva a sustituir PyTorch CUDA. Para forzar el comportamiento use `--nvidia` o `--cpu`.
+`instalar.py --detector falconsai --auto` y `--detector freepik --auto` detectan `nvidia-smi`. Si existe una GPU NVIDIA utilizable, instala PyTorch desde el índice CUDA oficial y valida una inferencia real en GPU. En Conda ya no es necesario usar `--permitir-entorno-global` cuando `CONDA_PREFIX` coincide con el Python activo.
+
+El instalador rechaza una rueda `+cpu` cuando se seleccionó NVIDIA y evita que `requirements-falconsai.txt` vuelva a sustituir PyTorch CUDA. Para forzar el comportamiento use `--nvidia` o `--cpu`.
 
 ---
+
+## 🧭 Nombres de detectores
+
+Los nombres públicos identifican el detector, no el sitio donde se aloja el modelo:
+
+- `nudenet`: detector NudeNet mediante ONNX Runtime.
+- `falconsai`: `Falconsai/nsfw_image_detection`, alojado en Hugging Face Hub.
+- `freepik`: `Freepik/nsfw_image_detector`, alojado en Hugging Face Hub.
+
+Solo se aceptan esos tres nombres. `huggingface` identifica al proveedor en los metadatos y al motor base de Transformers, pero no es un detector válido para `--detector`.
 
 ## 🚀 Uso
 
@@ -51,12 +65,34 @@ python NsfwVideoRemover.py video.mp4 \
   --codec auto
 ```
 
-### 2. Usando Hugging Face (ej. Falconsai)
+### 2. Usando Freepik EVA-02 (recomendado)
+
+El backend `freepik` selecciona automáticamente `Freepik/nsfw_image_detector`, que devuelve cuatro probabilidades: `neutral`, `low`, `medium` y `high`. La política predeterminada corta cuando se cumple cualquiera de estas reglas:
+
+- `low + medium + high >= 0.60`
+- `medium + high >= 0.45`
+- `high >= 0.25`
+
+```bash
+python NsfwVideoRemover.py video.mp4 \
+  --detector freepik \
+  --device auto \
+  --clip-duration 0.5 \
+  --freepik-unsafe-threshold 0.60 \
+  --freepik-medium-high-threshold 0.45 \
+  --freepik-high-threshold 0.25 \
+  --cut-padding 4 \
+  --hardware-accel auto \
+  --codec auto
+```
+
+No es necesario indicar `--model-id` salvo que se quiera probar otro modelo compatible de cuatro niveles.
+
+### 3. Usando Falconsai (modelo alojado en Hugging Face)
 Usa la puntuación de la etiqueta NSFW para compararla con el umbral.
 ```bash
 python NsfwVideoRemover.py video.mp4 \
-  --detector huggingface \
-  --model-id Falconsai/nsfw_image_detection \
+  --detector falconsai \
   --device auto \
   --analysis-max-dimension 1280 \
   --nsfw-threshold 0.50 \
@@ -65,17 +101,35 @@ python NsfwVideoRemover.py video.mp4 \
   --codec auto
 ```
 
-### 3. Modo Análisis (Solo revisión)
+### 4. Modo Análisis (Solo revisión)
 Genera `video.srt` y `video.analysis.json` sin renderizar un nuevo video ni aplicar recodificación. Elimina videos de salida antiguos para evitar confusiones.
 ```bash
-python NsfwVideoRemover.py video.mp4 --detector huggingface --analyze-only
+python NsfwVideoRemover.py video.mp4 --detector freepik --analyze-only
 ```
 
 ---
 
+## 🎯 Freepik multiclase (v2.7.0)
+
+`FreepikImageDetector` reutiliza el motor directo de Transformers, mantiene precisión FP32 y adapta la salida multiclase al contrato común del proyecto. El JSON conserva las probabilidades originales y añade:
+
+- `unsafe = low + medium + high`
+- `medium_high = medium + high`
+
+La decisión es *fail-closed* ante etiquetas incompatibles: si el modelo no devuelve `neutral/low/medium/high`, el análisis se detiene en lugar de considerar el frame sano.
+
+Como el modelo procesa imágenes de 448×448, el lote automático es más conservador que con Falconsai:
+
+- 12 GiB o más libres: lote 16.
+- 6 GiB o más: lote 8.
+- 3 GiB o más: lote 4.
+- Menos de 3 GiB: lote 2.
+
+El fallback por falta de VRAM reduce el lote a la mitad y reintenta. El profiler registra los tres umbrales, la política aplicada y el lote máximo realmente ejecutado.
+
 ## ⚡ Falconsai optimizado (v2.6.1)
 
-El backend Hugging Face ya no utiliza `transformers.pipeline` durante producción. Carga directamente `AutoImageProcessor` y `AutoModelForImageClassification`, ejecuta el modelo bajo `torch.inference_mode()` y conserva precisión FP32.
+El backend `falconsai` ya no utiliza `transformers.pipeline` durante producción. Carga directamente `AutoImageProcessor` y `AutoModelForImageClassification`, ejecuta el modelo bajo `torch.inference_mode()` y conserva precisión FP32.
 
 La selección automática de lote usa la VRAM libre después de cargar el modelo:
 
@@ -92,7 +146,7 @@ Ejemplo conservador:
 
 ```bash
 python NsfwVideoRemover.py video.mp4 \
-  --detector huggingface \
+  --detector falconsai \
   --device auto \
   --nsfw-threshold 0.15 \
   --clip-duration 0.5 \
@@ -193,7 +247,9 @@ NsfwVideoProcessor (Orquestador)
  ├─ SegmentPlanner (Crea segmentos matemáticamente)
  ├─ ContentDetector (Interfaz / Protocolo para los modelos)
  │   ├─ NudeNetDetector
- │   └─ HuggingFaceImageDetector
+ │   ├─ HuggingFaceImageDetector (motor base de Transformers)
+ │   ├─ FalconsaiImageDetector
+ │   └─ FreepikImageDetector
  ├─ CutIntervalPolicy (Combina rangos y aplica padding)
  ├─ AnalysisReportWriter (SRT y JSON atómicos)
  ├─ PerformanceProfiler (eventos, árbol de procesos, RAM, GPU/VRAM y progreso)
@@ -229,20 +285,46 @@ DetectorFactory.register("mi-detector", lambda config: MiDetector())
 ---
 
 ## 📄 Formato del Informe JSON
-Todos los backends generan una estructura estable. En el nivel superior, `allowed_intervals` contiene los tramos sanos solicitados y `rendered_intervals` los límites realmente usados. `expected_output_duration_seconds` es la suma de los intervalos sanos y `actual_output_duration_seconds` registra la duración comprobada del archivo final. Con `--codec auto`, `render_mode` será `h264_nvenc` cuando NVENC funcione y `libx264` como fallback. Con `--codec copy`, los límites pueden desplazarse hacia dentro y `render_mode` será `copy`:
+Todos los backends generan una estructura estable. El nivel superior separa `detector`, `provider` y `model_id`. En el nivel superior, `allowed_intervals` contiene los tramos sanos solicitados y `rendered_intervals` los límites realmente usados. `expected_output_duration_seconds` es la suma de los intervalos sanos y `actual_output_duration_seconds` registra la duración comprobada del archivo final. Con `--codec auto`, `render_mode` será `h264_nvenc` cuando NVENC funcione y `libx264` como fallback. Con `--codec copy`, los límites pueden desplazarse hacia dentro y `render_mode` será `copy`:
 ```json
 {
-  "orden": 1,
-  "intervalo": [0.0, 1.0],
-  "nsfw": false,
-  "score_nsfw": 0.08,
-  "motivo": null,
-  "metricas": {"nsfw": 0.08},
-  "modelo": "Falconsai/nsfw_image_detection",
-  "detecciones": [
-    {"class": "normal", "score": 0.92},
-    {"class": "nsfw", "score": 0.08}
+  "schema_version": 1,
+  "detector": "falconsai",
+  "provider": "huggingface",
+  "model_id": "Falconsai/nsfw_image_detection",
+  "segments": [
+    {
+      "orden": 1,
+      "intervalo": [0.0, 1.0],
+      "nsfw": false,
+      "score_nsfw": 0.08,
+      "motivo": null,
+      "metricas": {"nsfw": 0.08},
+      "modelo": "Falconsai/nsfw_image_detection",
+      "detecciones": [
+        {"class": "normal", "score": 0.92},
+        {"class": "nsfw", "score": 0.08}
+      ]
+    }
   ]
+}
+```
+
+Con Freepik, `metricas` conserva el detalle multiclase:
+
+```json
+{
+  "nsfw": true,
+  "score_nsfw": 0.31,
+  "metricas": {
+    "neutral": 0.69,
+    "low": 0.18,
+    "medium": 0.10,
+    "high": 0.03,
+    "unsafe": 0.31,
+    "medium_high": 0.13
+  },
+  "modelo": "Freepik/nsfw_image_detector"
 }
 ```
 
@@ -254,7 +336,7 @@ Todos los backends generan una estructura estable. En el nivel superior, `allowe
 ```bash
 python -m unittest discover -s tests -v
 ```
-Las pruebas cubren fallbacks, presupuestos de ONNX, combinaciones de intervalos, reescritura atómica, esquema del profiler y progreso real de FFmpeg.
+Las 63 pruebas cubren fallbacks, presupuestos de ONNX, la política multiclase de Freepik, combinaciones de intervalos, reescritura atómica, esquema del profiler y progreso real de FFmpeg.
 
 **Consideraciones importantes:**
 - Ningún modelo es perfecto. Revisa el JSON/SRT antes de automatizar el borrado.
@@ -266,16 +348,3 @@ Las pruebas cubren fallbacks, presupuestos de ONNX, combinaciones de intervalos,
 - Cada segmento marcado se elimina completo. `--cut-padding` solo amplía el corte antes del inicio y después del final del segmento; con `--cut-padding 0` todavía se elimina el segmento detectado.
 - Si el informe muestra cortes más amplios de lo deseado, reduce `--cut-padding`; el renderizador no añade pérdida extra en modo `auto`.
 - Cada modelo de Hugging Face usa etiquetas distintas. Lee la *Model Card* antes de cambiar `--model-id`.
-
-
-### Corrección 2.6.1: NVDEC con batches grandes y equivalencia del preprocesado
-
-- El tamaño de la cola/lote de Falconsai ya no aumenta `-extra_hw_frames`; el decoder CUDA usa un máximo validado de 12 superficies y conserva el fallback CPU.
-- La inferencia directa convierte cada muestra a RGB PIL igual que el pipeline anterior. Esto elimina el aviso de arrays NumPy de solo lectura y evita variaciones de score por usar otro backend de redimensionamiento.
-- `detector_runtime_batch_size` registra el mayor lote realmente ejecutado, no el tamaño del último lote incompleto.
-
-## Corrección 2.4.1: final de pista y fallback NVDEC
-
-Algunos MP4 informan la duración del contenedor o del audio como duración total, aunque la pista de video termine unas décimas antes. En 2.4.1, un único frame faltante al final con salida limpia de FFmpeg se resuelve reutilizando el último frame disponible para analizar el segmento final. Los fallos reales de NVDEC reinician automáticamente el análisis con decodificación CPU.
-
-El profiler registra estas situaciones mediante `reuse_last_frame_for_trailing_segment`, `retry_analysis_with_software_decode`, `reused_trailing_analysis_frames` y `hardware_decode_fallbacks`.
