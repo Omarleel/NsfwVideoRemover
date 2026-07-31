@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nsfw-video-remover"
-version = "2.4.1"
+version = "2.5.1"
 description = "Video analysis and cutting pipeline with interchangeable image detectors."
 readme = "README.md"
 requires-python = ">=3.10"

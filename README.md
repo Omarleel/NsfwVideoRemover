@@ -26,6 +26,12 @@ python -m venv .venv
 
 *(Para probar la carga del modelo de Hugging Face: `python diagnostico.py --detector huggingface --load-model`)*
 
+### Instalación Hugging Face con GPU NVIDIA
+
+`instalar.py --detector huggingface --auto` detecta `nvidia-smi`. Si existe una GPU NVIDIA utilizable, instala PyTorch desde el índice CUDA oficial y valida una inferencia real en GPU. En Conda ya no es necesario usar `--permitir-entorno-global` cuando `CONDA_PREFIX` coincide con el Python activo.
+
+El instalador rechaza una rueda `+cpu` cuando se seleccionó NVIDIA y evita que `requirements-huggingface.txt` vuelva a sustituir PyTorch CUDA. Para forzar el comportamiento use `--nvidia` o `--cpu`.
+
 ---
 
 ## 🚀 Uso

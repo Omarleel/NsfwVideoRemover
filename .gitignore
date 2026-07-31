@@ -14,3 +14,4 @@ videos/
 build/
 dist/
 *.egg-info/
+*.zip

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import platform
 import shutil
 import struct
@@ -11,6 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ORT_VERSION = "1.23.2"
+PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu130"
+PYTORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -36,10 +40,12 @@ def nvidia_is_visible() -> bool:
 
 
 def is_virtual_environment() -> bool:
-    return bool(
-        getattr(sys, "real_prefix", None)
-        or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    )
+    # venv/virtualenv
+    if getattr(sys, "real_prefix", None) or sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        return True
+    # Conda does not always change base_prefix, so detect its active prefix explicitly.
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    return bool(conda_prefix and Path(conda_prefix).resolve() == Path(sys.prefix).resolve())
 
 
 def validate_environment(*, allow_global: bool) -> None:
@@ -87,6 +93,7 @@ def diagnostic_command(
     detector: str,
     require_cuda: bool,
     model_id: str,
+    load_model: bool = False,
 ) -> list[str]:
     command = [
         python,
@@ -98,6 +105,8 @@ def diagnostic_command(
     ]
     if require_cuda:
         command.append("--require-cuda")
+    if load_model:
+        command.append("--load-model")
     return command
 
 
@@ -131,6 +140,59 @@ def repair_nvidia_installation(
     )
 
 
+def torch_runtime_info(python: str) -> dict[str, object]:
+    script = (
+        "import json; "
+        "import torch; "
+        "print(json.dumps({"
+        "'version': torch.__version__, "
+        "'compiled_cuda': torch.version.cuda, "
+        "'cuda_available': bool(torch.cuda.is_available()), "
+        "'device_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None"
+        "}))"
+    )
+    result = subprocess.run(
+        [python, "-c", script], capture_output=True, text=True, check=False, timeout=30
+    )
+    if result.returncode != 0:
+        return {"import_error": (result.stderr or result.stdout).strip()}
+    try:
+        return json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {"import_error": result.stdout.strip()}
+
+
+def install_pytorch_runtime(
+    pip: list[str],
+    python: str,
+    *,
+    selected_profile: str,
+    clean: bool = False,
+) -> None:
+    index_url = PYTORCH_CUDA_INDEX if selected_profile == "nvidia" else PYTORCH_CPU_INDEX
+    command = pip + ["install", "--upgrade"]
+    if clean:
+        command += ["--force-reinstall", "--no-cache-dir"]
+    command += ["torch", "torchvision", "--index-url", index_url]
+    run(command)
+
+    info = torch_runtime_info(python)
+    print(
+        "PyTorch instalado: "
+        f"versión={info.get('version', 'desconocida')}; "
+        f"CUDA compilada={info.get('compiled_cuda')}; "
+        f"CUDA disponible={info.get('cuda_available')}; "
+        f"GPU={info.get('device_name')}"
+    )
+    if selected_profile == "nvidia" and not (
+        info.get("compiled_cuda") and info.get("cuda_available")
+    ):
+        raise RuntimeError(
+            "La rueda instalada de PyTorch no puede usar CUDA. "
+            "No se aceptará una degradación silenciosa a CPU."
+        )
+
+
 def install_huggingface(
     pip: list[str],
     python: str,
@@ -139,18 +201,68 @@ def install_huggingface(
     run_diagnostics: bool,
     model_id: str,
 ) -> None:
-    run(pip + ["install", "--upgrade", "-r", str(ROOT / "requirements-huggingface.txt")])
+    selected = requested_profile
+    if selected == "auto":
+        selected = "nvidia" if nvidia_is_visible() else "cpu"
+    if selected == "nvidia" and platform.system() not in {"Windows", "Linux"}:
+        if requested_profile == "nvidia":
+            raise SystemExit("PyTorch CUDA solo se instala automáticamente en Windows o Linux.")
+        selected = "cpu"
+
+    print(f"Perfil Hugging Face seleccionado: {selected}")
+    # Instala primero dependencias que no son torch; torch se instala desde su índice
+    # oficial específico para evitar que PyPI elija una rueda CPU-only.
+    run(pip + ["install", "--upgrade", "-r", str(ROOT / "requirements-common.txt")])
+    run(
+        pip
+        + [
+            "install",
+            "--upgrade",
+            "transformers>=4.40,<6",
+            "pillow>=10,<13",
+            "safetensors>=0.4,<1",
+        ]
+    )
+
+    try:
+        install_pytorch_runtime(pip, python, selected_profile=selected)
+    except (subprocess.CalledProcessError, RuntimeError) as exc:
+        if requested_profile == "nvidia":
+            raise SystemExit(f"No se pudo instalar/validar PyTorch CUDA: {exc}") from exc
+        if selected == "nvidia":
+            print(
+                "PyTorch CUDA no quedó operativo. Se hará una reparación limpia "
+                "antes de considerar CPU."
+            )
+            run(pip + ["uninstall", "-y", "torch", "torchvision", "torchaudio"], check=False)
+            try:
+                install_pytorch_runtime(
+                    pip, python, selected_profile="nvidia", clean=True
+                )
+            except (subprocess.CalledProcessError, RuntimeError) as retry_exc:
+                print(f"La reparación CUDA falló: {retry_exc}")
+                print("Se instalará CPU porque se solicitó --auto.")
+                run(
+                    pip + ["uninstall", "-y", "torch", "torchvision", "torchaudio"],
+                    check=False,
+                )
+                selected = "cpu"
+                install_pytorch_runtime(pip, python, selected_profile="cpu", clean=True)
+        else:
+            raise
+
     if not run_diagnostics:
         print("\nInstalación Hugging Face completada sin diagnóstico.")
         return
 
-    require_cuda = requested_profile == "nvidia"
+    require_cuda = selected == "nvidia"
     code = run(
         diagnostic_command(
             python,
             detector="huggingface",
             require_cuda=require_cuda,
             model_id=model_id,
+            load_model=True,
         ),
         check=False,
     ).returncode
@@ -160,7 +272,8 @@ def install_huggingface(
             "Revisa la salida anterior."
         )
     print(
-        "\nInstalación Hugging Face validada. El modelo se descargará en la "
+        "\nInstalación Hugging Face validada. "
+        f"Dispositivo seleccionado: {selected}. El modelo se descargará en la "
         "primera ejecución o con diagnostico.py --load-model."
     )
 
